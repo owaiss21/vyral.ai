@@ -8,7 +8,7 @@ def _as_int(x, name: str) -> int:
     try:
         xi = int(x)
     except Exception as e:
-        raise ValueError(f"{name} not an int-compatible value: {x!r} ({e})")
+        raise ValueError(f"{name} not int-compatible: {x!r} ({e})")
     return xi
 
 def _as_float(x, name: str) -> float:
@@ -17,29 +17,10 @@ def _as_float(x, name: str) -> float:
     try:
         xf = float(x)
     except Exception as e:
-        raise ValueError(f"{name} not a float-compatible value: {x!r} ({e})")
+        raise ValueError(f"{name} not float-compatible: {x!r} ({e})")
     if math.isnan(xf) or math.isinf(xf):
         raise ValueError(f"{name} invalid (NaN/Inf): {x!r}")
     return xf
-
-def _aspect_fit_box(
-    x: float, y: float, w: float, h: float,
-    W: int, H: int, ar_w: int, ar_h: int
-) -> tuple[float, float, float, float]:
-    """Expand box to match target aspect (ar_w:ar_h), clamp inside frame."""
-    target = ar_w / float(ar_h)
-    cx, cy = x + w / 2.0, y + h / 2.0
-    bw, bh = float(max(1.0, w)), float(max(1.0, h))
-    cur = bw / bh
-    if cur > target:    # too wide -> increase height
-        bh = bw / target
-    else:               # too tall -> increase width
-        bw = bh * target
-    nx = max(0.0, min(cx - bw / 2.0, W - bw))
-    ny = max(0.0, min(cy - bh / 2.0, H - bh))
-    bw = min(bw, W)
-    bh = min(bh, H)
-    return nx, ny, bw, bh
 
 def build_crop_schedule(
     fused: List[Tuple[float, float, int]],
@@ -48,31 +29,36 @@ def build_crop_schedule(
     H_in: int | float | None,
     play_w_in: int | float | None,
     play_h_in: int | float | None,
-    margin_in: float | None = 1.6,
-    headroom_in: float | None = 0.12,
-    smooth_alpha_in: float | None = 0.6,
+    margin_in: float | None = 1.6,         # kept for API compatibility (unused in portrait-full-height mode)
+    headroom_in: float | None = 0.12,      # kept for API compatibility (unused here)
+    smooth_alpha_in: float | None = 0.6,   # kept for API compatibility (unused here)
 ) -> List[Tuple[float, float, float, float, float, float]]:
     """
-    Build a piecewise-constant crop schedule in source coords.
-    Returns List[(t0, t1, x, y, w, h)] where (w,h) already matches the portrait aspect.
-    """
+    Build a crop schedule that ALWAYS produces 9:16 portrait windows using the FULL source height.
+    Logic:
+      - h = H (full height)
+      - w = floor(H * 9 / 16)
+      - For each interval [s,e] and track id, compute the face box nearest to time s (or last before s).
+      - Center the crop horizontally at the face center x; clamp to [0, W - w]; set y = 0.
+      - If fused is empty, create one interval covering the min..max time seen in tracks, centered on the
+        most supported track (largest number of boxes). This keeps active-crop semantics without blur fallback.
 
-    # --- Validate & coerce scalar params early (so errors are clear and close to source) ---
-    W = _as_int(W_in, "source width W")
-    H = _as_int(H_in, "source height H")
-    play_w = _as_int(play_w_in, "portrait width play_w")
-    play_h = _as_int(play_h_in, "portrait height play_h")
+    Returns: List[(t0, t1, x, y, w, h)]
+    """
+    # Source / target geometry
+    W  = _as_int(W_in, "source width W")
+    H  = _as_int(H_in, "source height H")
+    _  = _as_int(play_w_in, "portrait width play_w")   # only validated; not used to compute crop
+    __ = _as_int(play_h_in, "portrait height play_h")  # only validated; not used to compute crop
     if W <= 0 or H <= 0:
         raise ValueError(f"invalid source dimensions W={W}, H={H}")
-    if play_w <= 0 or play_h <= 0:
-        raise ValueError(f"invalid portrait dimensions play_w={play_w}, play_h={play_h}")
 
-    margin = _as_float(margin_in, "margin")
-    headroom = _as_float(headroom_in, "headroom")
-    smooth_alpha = _as_float(smooth_alpha_in, "smooth_alpha")
-    smooth_alpha = min(0.99, max(0.0, smooth_alpha))
+    # Portrait crop using full height
+    crop_h = float(H)
+    crop_w = float(max(2, min(W, int(round(H * 9.0 / 16.0)))))  # clamp width to source width
+    # If the source is already narrower than 9:16, keep crop_w = W (rare for landscape inputs)
 
-    # --- Build track map; drop invalid boxes (None/NaN or non-positive size) ---
+    # Build track map (sorted by time, cleaned)
     tmap: Dict[int, List[Tuple[float, float, float, float, float]]] = {}
     for tr in tracks or []:
         tid = int(tr.get("id"))
@@ -83,25 +69,18 @@ def build_crop_schedule(
             tb, x, y, w, h = box
             try:
                 tb = _as_float(tb, "box.t")
-                x = _as_float(x, "box.x")
-                y = _as_float(y, "box.y")
-                w = _as_float(w, "box.w")
-                h = _as_float(h, "box.h")
+                x  = _as_float(x,  "box.x")
+                y  = _as_float(y,  "box.y")
+                w  = _as_float(w,  "box.w")
+                h  = _as_float(h,  "box.h")
             except Exception:
                 continue
             if w <= 1 or h <= 1:
                 continue
-            if x < 0 or y < 0 or x >= W or y >= H:
-                # we still accept it; will be clamped later by _aspect_fit_box
-                pass
             cleaned.append((tb, x, y, w, h))
         if cleaned:
-            # ensure chronological order
             cleaned.sort(key=lambda t: t[0])
             tmap[tid] = cleaned
-
-    if not tmap:
-        raise ValueError("no valid boxes in tracks after cleaning")
 
     def last_box_before(tid: int, t: float):
         arr = tmap.get(tid) or []
@@ -113,52 +92,77 @@ def build_crop_schedule(
                 break
         return last
 
+    def track_support_count(tid: int) -> int:
+        return len(tmap.get(tid) or [])
+
+    # If fused is empty, synthesize a single interval from tracks' time span
+    fused_intervals: List[Tuple[float, float, int]] = []
+    if fused:
+        # Validate fused and keep only sane segments
+        for seg in fused:
+            if seg is None or len(seg) != 3:
+                continue
+            s_raw, e_raw, tid_raw = seg
+            try:
+                s = _as_float(s_raw, "fused.start")
+                e = _as_float(e_raw, "fused.end")
+                tid = int(tid_raw)
+            except Exception:
+                continue
+            if e <= s:
+                continue
+            fused_intervals.append((s, e, tid))
+    else:
+        # Derive a reasonable default interval and speaker id from tracks
+        all_times: List[float] = []
+        for arr in tmap.values():
+            all_times.extend([tb for (tb, *_rest) in arr])
+        if all_times:
+            s_def = min(all_times)
+            e_def = max(all_times)
+            # choose the most supported track
+            cand = sorted((tid for tid in tmap.keys()), key=lambda t: track_support_count(t), reverse=True)
+            if cand:
+                fused_intervals = [(s_def, e_def, cand[0])]
+
     schedule: List[Tuple[float, float, float, float, float, float]] = []
-    prev_cxcy: tuple[float, float] | None = None
+    if not fused_intervals:
+        # If still nothing, return a single center-crop over the entire visible time window (or time 0..0.001)
+        # This keeps active-crop alive but clearly indicates upstream detectors were too sparse.
+        # We avoid raising to keep your run flowing for batches; you can detect this case by seeing a single interval.
+        s_fallback = 0.0
+        e_fallback = 0.001
+        cx = W / 2.0
+        x = max(0.0, min(cx - crop_w / 2.0, W - crop_w))
+        schedule.append((s_fallback, e_fallback, float(x), 0.0, float(crop_w), float(crop_h)))
+        return schedule
 
-    for seg in fused or []:
-        if seg is None or len(seg) != 3:
-            continue
-        s_raw, e_raw, tid_raw = seg
-        try:
-            s = _as_float(s_raw, "fused.start")
-            e = _as_float(e_raw, "fused.end")
-            tid = int(tid_raw)
-        except Exception:
-            continue
-        if e <= s:
-            continue
-
+    for (s, e, tid) in fused_intervals:
+        # Pick the last box before 's' for that track; if none, try the earliest box for that track
         box = last_box_before(tid, s)
         if box is None:
-            # No box before 's' for this tid—skip segment
-            continue
+            arr = tmap.get(tid) or []
+            if arr:
+                _tb, x0, y0, w0, h0 = arr[0]
+                box = (x0, y0, w0, h0)
 
-        x, y, w, h = box
-        # expand around face
-        cx = x + w / 2.0
-        cy = y + h / 2.0
-        w2 = max(2.0, w * margin)
-        h2 = max(2.0, h * margin)
-        x2 = cx - w2 / 2.0
-        y2 = cy - h2 / 2.0
+        # If still None (no boxes for this tid), try the most supported track overall
+        if box is None:
+            cand = sorted((tid2 for tid2 in tmap.keys()), key=lambda t: track_support_count(t), reverse=True)
+            if cand:
+                arr = tmap.get(cand[0]) or []
+                if arr:
+                    _tb, x0, y0, w0, h0 = arr[0]
+                    box = (x0, y0, w0, h0)
 
-        # fit portrait aspect
-        x3, y3, w3, h3 = _aspect_fit_box(x2, y2, w2, h2, W, H, play_w, play_h)
-        # headroom shift up
-        y3 = max(0.0, y3 - headroom * h3)
-
-        # smooth center across segments
-        cx3, cy3 = x3 + w3 / 2.0, y3 + h3 / 2.0
-        if prev_cxcy is None:
-            cxf, cyf = cx3, cy3
+        # If we genuinely have no boxes at all, center in the frame to keep schedule valid
+        if box is None:
+            cx = W / 2.0
         else:
-            cxf = smooth_alpha * prev_cxcy[0] + (1.0 - smooth_alpha) * cx3
-            cyf = smooth_alpha * prev_cxcy[1] + (1.0 - smooth_alpha) * cy3
-        prev_cxcy = (cxf, cyf)
+            x0, y0, w0, h0 = box
+            cx = x0 + w0 / 2.0
 
-        xf = max(0.0, min(cxf - w3 / 2.0, W - w3))
-        yf = max(0.0, min(cyf - h3 / 2.0, H - h3))
-        schedule.append((float(s), float(e), float(xf), float(yf), float(w3), float(h3)))
+        x = max(0.0, min(cx - crop_w / 2.0, W - crop_w))
+        schedule.append((float(s), float(e), float(x), 0.0, float(crop_w), float(crop_h)))
 
     return schedule
