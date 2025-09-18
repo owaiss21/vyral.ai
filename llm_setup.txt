@@ -1,0 +1,16 @@
+OpenAI Setup
+============
+
+1) Create an API key at: https://platform.openai.com/
+2) Put the following in a `.env` file next to this project:
+
+OPENAI_API_KEY=sk-...
+OPENAI_MODEL=gpt-4o-mini
+# Optional:
+# OPENAI_BASE_URL=https://api.openai.com/v1
+# OPENAI_ORG=org_...
+
+3) Install requirements:
+pip install -r requirements.txt
+
+4) You're ready to run the pipeline. No local model server required.

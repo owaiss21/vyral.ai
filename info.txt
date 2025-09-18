@@ -1,0 +1,192 @@
+# HOW TO RUN (Windows)
+
+## 0) Setup
+
+1. **Install FFmpeg** (required by movie/ffmpeg steps) and make sure `ffmpeg.exe` is on your `PATH`.
+
+2. **Create a `.env`** in the project root (same folder as `main.py`):
+
+```
+OPENAI_API_KEY=sk-your-key
+OPENAI_MODEL=gpt-4o-mini
+# Optional:
+# OPENAI_BASE_URL=https://api.openai.com/v1
+# OPENAI_ORG=org_...
+```
+
+(Alternatively in PowerShell: `setx OPENAI_API_KEY "sk-your-key"` then open a new terminal.)
+
+3. **Install requirements**
+
+```
+pip install -r requirements.txt
+```
+
+Paths below assume a working directory folder named `workdir` under the project root.
+
+---
+
+## 1) Orchestrated run with `main.py`
+
+### A. Full pipeline from a YouTube URL
+
+```
+python main.py --start download --url "https://www.youtube.com/watch?v=XXXX" --workdir workdir
+```
+
+### B. From a local video (skip download)
+
+```
+python main.py --start extract ^
+  --video "E:\Projects\shorts_generation_agent\assets\video.mp4" ^
+  --workdir workdir
+```
+
+### C. From an audio you already have (skip download & extract)
+
+```
+python main.py --start transcribe ^
+  --audio "E:\Projects\shorts_generation_agent\workdir\raw_audios\audio.wav" ^
+  --workdir workdir
+```
+
+### D. From an existing transcript (JSON) → start at transliteration
+
+```
+python main.py --start transliterate ^
+  --transcript "workdir\transcriptions\file.json" ^
+  --workdir workdir
+```
+
+### E. From an existing transliteration (`*_roman.json`) → plan
+
+```
+python main.py --start plan ^
+  --transcript "workdir\transliteration\file_roman.json" ^
+  --workdir workdir
+```
+
+### F. From an existing plan → edit/render shorts
+
+```
+python main.py --start edit ^
+  --plan "workdir\llm_shorts\file_plan.json" ^
+  --video "E:\path\video.mp4" ^
+  --workdir workdir
+```
+
+* If `--transcript` is omitted, `main.py` will prefer the **latest** `*_roman.json` in `workdir\transliteration`.
+* If `--video` is omitted at `--start edit`, `main.py` will attempt to **infer** the source video by stem from `workdir\raw_videos`, otherwise it will fall back to the most recent file there.
+
+### Useful switches (defaults come from `config.py`)
+
+```
+--whisper-model large-v3
+--device auto|cpu|cuda
+--force-language ur|hi|en       (explicit override for ASR)
+--audio-profile opus_copy|music_wav|speech_wav
+```
+
+> LLM model, endpoint, and org are read from `.env` / `config.py` (`OPENAI_MODEL`, `OPENAI_BASE_URL`, `OPENAI_ORG`). No Ollama/llama flags are used.
+
+---
+
+## 2) One-shot runner with `pipeline.py`
+
+### A. From a YouTube URL
+
+```
+python pipeline.py ^
+  --url "https://www.youtube.com/watch?v=XXXX" ^
+  --workdir workdir
+```
+
+### B. From a local video
+
+```
+python pipeline.py ^
+  --video "E:\Projects\shorts_generation_agent\assets\video.mp4" ^
+  --workdir workdir
+```
+
+(Automatically performs: download/extract → transcribe → transliterate → plan → edit.)
+
+---
+
+## 3) Running individual modules (advanced)
+
+> Use these to debug or run a single stage. Output folders default to subdirectories under `--workdir` (you can override with `--out`).
+
+### A. Download only
+
+```
+python modules\downloader.py ^
+  --url "https://www.youtube.com/watch?v=XXXX" ^
+  --out "workdir\raw_videos"
+```
+
+### B. Extract audio from a local MP4
+
+```
+python modules\extract_audio.py ^
+  --video "E:\path\video.mp4" ^
+  --out "workdir\raw_audios"
+```
+
+### C. Transcribe (Whisper via faster-whisper)
+
+```
+python modules\transcribe.py ^
+  --audio "workdir\raw_audios\audio.wav" ^
+  --out "workdir\transcriptions" ^
+  --whisper-model large-v3 ^
+  --device auto
+```
+
+Produces a JSON transcript and an SRT.
+
+### D. Transliterate to Roman Urdu (`*_roman.json`)
+
+```
+python modules\transliteration.py ^
+  --transcript "workdir\transcriptions\file.json" ^
+  --out "workdir\transliteration"
+```
+
+Requires `OPENAI_API_KEY`. Converts only native-script lines/words; English lines pass through.
+
+### E. Plan clips (LLM planning on the transliterated transcript)
+
+```
+python modules\llm_clipper.py ^
+  --transcript "workdir\transliteration\file_roman.json" ^
+  --out "workdir\llm_shorts" ^
+  --num-clips 5 ^
+  --target-duration 35
+```
+
+Writes a plan like `file_plan.json` with `[{"start":...,"end":...,"title":...,"caption":...}, ...]`.
+
+### F. Render shorts (cuts according to plan; portrait output)
+
+```
+python modules\video_editing.py ^
+  --video "E:\path\video.mp4" ^
+  --transcript "workdir\transliteration\file_roman.json" ^
+  --plan "workdir\llm_shorts\file_plan.json" ^
+  --out "workdir\finalized_shorts"
+```
+
+Outputs `short_01.mp4`, `short_02.mp4`, … under `finalized_shorts`.
+
+---
+
+## Notes
+
+* **Defaults** for models, durations, and toggles live in `config.py`. Paths remain CLI-driven.
+* **Conditional forcing** (e.g., enforce Urdu vs. pass-through English) is applied in **TRANSCRIBE** only.
+* **Transliteration** keeps English unchanged; it only romanizes native scripts to Roman Urdu.
+* **Planner** expects transliterated transcripts to judge hooks on Roman Urdu + English text.
+* **Verbosity** controlled in `config.py` (`verbose = True|False`). All stages print progress/ETA. Rendering shows per-clip progress.
+
+---

@@ -1,0 +1,10 @@
+.env
+*.tmp
+yt_cookies.txt
+*__pycache__
+*.pyc
+workdir
+crop_video.py
+
+.ig_session.json
+
