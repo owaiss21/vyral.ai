@@ -1,20 +1,19 @@
 from __future__ import annotations
 from pathlib import Path
-from typing import List, Dict, Any, Tuple
-import json, re, shutil, subprocess, tempfile, time, os
+from typing import List, Dict, Any
+import json, re, shutil, subprocess, tempfile, os
 
-# --------------------------- Config + utils ---------------------------
+# --------------------------- Config (fallbacks if config.DEFAULT missing) ---------------------------
 try:
     from config import DEFAULT as CFG
 except Exception:
     class _CFG:
         verbose = True
-        # Paths / tools
-        ffmpeg_path = "ffmpeg"                  # override if ffmpeg is not on PATH
-        # Canvas
+        ffmpeg_path = "ffmpeg"
+        # Canvas/output geometry
         portrait_width = 1080
         portrait_height = 1920
-        # Blur bg + color tweak
+        # Legacy blur canvas settings (used when active crop is False)
         enable_blur_bg = True
         bg_blur_sigma = 24.0
         color_contrast = 1.08
@@ -24,7 +23,7 @@ except Exception:
         unsharp_luma_amount = 0.70
         unsharp_chroma_msize = (5, 5)
         unsharp_chroma_amount = 0.00
-        # Subtitles (ASS) – font + layout
+        # Captions
         caption_font = "Arial"
         caption_font_emph = "Arial Black"
         caption_base_fs = 92
@@ -32,17 +31,6 @@ except Exception:
         caption_min_fs = 72
         caption_margin_lr = 80
         caption_margin_v = 180
-        caption_border = 10
-        caption_shadow = 6
-        # Word chunking (kept for back-compat; max is still respected)
-        chunk_min_words = 3
-        chunk_max_words = 4
-        # Punch (contrast/saturation boost) around emphasis (disabled now)
-        enable_dynamic_punch = False
-        punch_contrast = 1.22
-        punch_saturation = 1.25
-        punch_gamma = 1.01
-        punch_unsharp = (7, 7, 1.00, 7, 7, 0.00)
         # Encoding
         vcodec = "libx264"
         preset = "slow"
@@ -50,318 +38,149 @@ except Exception:
         pix_fmt = "yuv420p"
         acodec = "aac"
         audio_bitrate_kbps = 192
+        # Active crop control
+        enable_active_crop = False
+        active_crop_margin = 1.6
+        active_crop_headroom = 0.12
+        active_crop_smooth_alpha = 0.6
     CFG = _CFG()
-
-try:
-    from modules.utils import ensure_dir, safe_stem, step
-except Exception:
-    # Minimal fallbacks
-    def ensure_dir(p: os.PathLike | str) -> Path:
-        pp = Path(p); pp.mkdir(parents=True, exist_ok=True); return pp
-    def safe_stem(s: str) -> str:
-        return re.sub(r"[^A-Za-z0-9_.-]+", "_", s)
-    def step(msg: str, verbose: bool = True) -> None:
-        if verbose: print(msg)
 
 VERBOSE = bool(getattr(CFG, "verbose", True))
 
-# --------------------------- Tokenization helpers ---------------------------
-_WORD_RE = re.compile(r"[A-Za-z0-9']+")
+# --------------------------- Small utils ---------------------------
+_DRIVE_COLON = re.compile(r"^([A-Za-z]):/")
 
-_STOPWORDS = {
-    "the","a","an","and","or","but","so","to","of","in","on","for","with","at","by","from",
-    "this","that","these","those","is","are","was","were","be","been","am","i","you","he",
-    "she","it","we","they","me","him","her","them","my","your","his","its","our","their",
-    "as","if","then","than","not","no","yes","do","does","did","done","have","has","had",
-    "can","could","will","would","shall","should","may","might","about","into","over","under",
-    "up","down","out","off","just","now","well","also","very","really","more","most","some",
-    "any","much","many","there","here","what","which","when","where","who","whom","why","how"
-}
+def ensure_dir(p: os.PathLike | str) -> Path:
+    pp = Path(p)
+    pp.mkdir(parents=True, exist_ok=True)
+    return pp
 
-def _tokenize(text: str) -> List[str]:
-    return _WORD_RE.findall(text or "")
+def safe_stem(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", s or "")
 
-def _extract_words(seg: Dict[str, Any]) -> List[Tuple[str, float, float]]:
-    """
-    Return [(word, start, end)] for a segment.
-    Prefer precise per-word timings in seg['words'].
-    """
-    s0, e0 = float(seg.get("start", 0.0)), float(seg.get("end", 0.0))
-    if not seg.get("words"):
-        # Fallback only if words missing (kept for backward compatibility).
-        txt = (seg.get("text") or "").strip()
-        words = _tokenize(txt)
-        if not words or e0 <= s0:
-            return []
-        dur = e0 - s0
-        step_dur = dur / len(words)
-        return [(w, s0 + i * step_dur, s0 + (i + 1) * step_dur) for i, w in enumerate(words)]
+def _ffmpeg_sub_path_arg(sub_path: Path) -> str:
+    # Convert Windows "C:/..." to "C\:/..." for FFmpeg
+    p = sub_path.resolve().as_posix()
+    p = _DRIVE_COLON.sub(r"\1\:/", p)
+    return f"subtitles=filename='{p}'"
 
-    out: List[Tuple[str, float, float]] = []
-    for w in seg["words"]:
-        wtxt = (w.get("word") or w.get("text") or "").strip()
-        if not wtxt:
-            continue
-        ws = float(w.get("start", s0)); we = float(w.get("end", s0))
-        ws = max(s0, ws); we = min(e0, we)
-        if we > ws:
-            out.append((wtxt, ws, we))
-    return out
+# --------------------------- ASS subtitles ---------------------------
+import re as _re
+_WORD_RE = _re.compile(r"[A-Za-z0-9']+")
 
-def _split_into_chunks_gap_aware(
-    words: List[Tuple[str, float, float]],
-    min_sz: int,
-    max_sz: int,
-    gap_thr: float = 0.22  # seconds; start a new chunk when gap > this
-) -> List[List[Tuple[str, float, float]]]:
-    """
-    Build chunks that never bridge across pauses (gaps) larger than gap_thr.
-    Also respects max_sz to avoid overly long lines; min_sz is best-effort.
-    """
-    chunks: List[List[Tuple[str, float, float]]] = []
-    if not words:
-        return chunks
+def _ass_time(t: float) -> str:
+    t = max(0.0, float(t))
+    h = int(t // 3600)
+    m = int((t % 3600) // 60)
+    s = int(t % 60)
+    cs = int(round((t - int(t)) * 100))
+    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
-    cur: List[Tuple[str, float, float]] = []
-    last_end = None
-    for triple in words:
-        w, ws, we = triple
-        if last_end is None:
-            cur = [triple]
-        else:
-            gap = ws - last_end
-            if gap > gap_thr or (cur and len(cur) >= max_sz):
-                chunks.append(cur)
-                cur = [triple]
-            else:
-                cur.append(triple)
-        last_end = we
-
-    if cur:
-        chunks.append(cur)
-
-    # If any chunk is smaller than min_sz but got isolated by a big gap, keep it as-is
-    return chunks
-
-def _pick_emphasis_index(words_only: List[str]) -> int:
-    best_idx, best_len = -1, -1
-    for i, w in enumerate(words_only):
-        if w.lower() in _STOPWORDS:
-            continue
-        L = len(w)
-        if L > best_len:
-            best_len = L
-            best_idx = i
-    if best_idx == -1:
-        best_idx = max(0, len(words_only) - 1)
-    return best_idx
-
-# --------------------------- ASS subtitle generation ---------------------------
-PLAY_W = int(getattr(CFG, "portrait_width", 1080))
-PLAY_H = int(getattr(CFG, "portrait_height", 1920))
-MARGIN_LR = int(getattr(CFG, "caption_margin_lr", 80))
-MARGIN_V  = int(getattr(CFG, "caption_margin_v", 180))
-SAFE_W = PLAY_W - 2 * MARGIN_LR
-
-# Move captions upward by additional 10% of canvas height
-MARGIN_V_EFF = MARGIN_V + int(0.10 * PLAY_H)
-
-BASE_FS = int(getattr(CFG, "caption_base_fs", 92))
-EMPH_FS = int(getattr(CFG, "caption_emph_fs", 112))
-MIN_FS  = int(getattr(CFG, "caption_min_fs", 72))
-
-CHAR_W_FACTOR = 0.55  # rough per-character width factor for Arial
-
-def _estimate_px(words: List[str], fs_norm: float, fs_emph: float, emph_idx: int) -> float:
-    px = 0.0
-    for i, w in enumerate(words):
-        fs = fs_emph if i == emph_idx else fs_norm
-        px += (len(w) * CHAR_W_FACTOR + (0.33 if i != 0 else 0.0)) * fs
-    return px
-
-def _format_chunk_line(words: List[str], emphasize_idx: int) -> str:
-    # ALL CAPS visually
-    words_vis = [w.upper() for w in words]
-
-    fs_norm, fs_emph = BASE_FS, EMPH_FS
-    est = _estimate_px(words_vis, fs_norm, fs_emph, emphasize_idx)
-    if est > SAFE_W:
-        scale = max(SAFE_W / est, MIN_FS / fs_norm)
-        fs_norm = int(max(MIN_FS, fs_norm * scale))
-        fs_emph = int(max(MIN_FS + 10, fs_emph * scale))
-
-    # re-check after scaling; if still too wide, split into 2 lines
-    est2 = _estimate_px(words_vis, fs_norm, fs_emph, emphasize_idx)
-    if est2 > SAFE_W * 1.05 and len(words_vis) >= 4:
-        words_vis = [words_vis[0] + " " + words_vis[1], " ".join(words_vis[2:])]
-        emphasize_idx = 0 if len(words_vis[0]) >= len(words_vis[1]) else 1
-
-    font  = str(getattr(CFG, "caption_font", "Arial"))
-    fontB = str(getattr(CFG, "caption_font_emph", "Arial Black"))
-    bord  = int(getattr(CFG, "caption_border", 10))
-    shad  = int(getattr(CFG, "caption_shadow", 6))
-
-    base_open = rf"{{\an2\q2\bord{bord}\shad{shad}\fad(60,60)\fn{font}\fs{fs_norm}\1c&HFFFFFF&}}"
-    emph_on   = rf"{{\b1\fn{fontB}\fs{fs_emph}\1c&H00FFFF&}}"   # yellow emphasis
-    emph_off  = rf"{{\b0\fn{font}\fs{fs_norm}\1c&HFFFFFF&}}"
-
-    parts: List[str] = [base_open]
-
-    # If we split into two lines manually, join with \N
-    if isinstance(words_vis, list) and len(words_vis) == 2 and " " in words_vis[0] and " " in words_vis[1]:
-        halves = words_vis
-        idx = 0 if len(halves[0]) >= len(halves[1]) else 1
-        for j, phrase in enumerate(halves):
-            if j == idx:
-                parts.append(emph_on + phrase + emph_off)
-            else:
-                parts.append(phrase)
-            if j == 0:
-                parts.append(r"\N")
-        return "".join(parts)
-
-    for i, w in enumerate(words_vis):
-        if i == emphasize_idx:
-            parts.append(emph_on + w + emph_off)
-        else:
-            parts.append(w)
-        if i != len(words_vis) - 1:
-            parts.append(" ")
-    return "".join(parts)
-
-def _ass_header() -> str:
-    font  = str(getattr(CFG, "caption_font", "Arial"))
-    fontB = str(getattr(CFG, "caption_font_emph", "Arial Black"))
-    return (
+def _write_clip_ass(segments: List[Dict[str, Any]], clip_start: float, clip_end: float, out_path: Path) -> None:
+    PLAY_W = int(getattr(CFG, "portrait_width", 1080))
+    PLAY_H = int(getattr(CFG, "portrait_height", 1920))
+    MARGIN_LR = int(getattr(CFG, "caption_margin_lr", 80))
+    MARGIN_V  = int(getattr(CFG, "caption_margin_v", 180))
+    BASE_FS = int(getattr(CFG, "caption_base_fs", 92))
+    EMPH_FS = int(getattr(CFG, "caption_emph_fs", 112))
+    CHAR_W_FACTOR = 0.55
+    STYLE_HEADER = (
         "[Script Info]\n"
         "ScriptType: v4.00+\n"
-        f"PlayResX: {PLAY_W}\n"
-        f"PlayResY: {PLAY_H}\n"
-        "ScaledBorderAndShadow: yes\n"
-        "Collisions: Normal\n"
-        "WrapStyle: 2\n"
-        "\n"
+        f"PlayResX: {PLAY_W}\nPlayResY: {PLAY_H}\n\n"
         "[V4+ Styles]\n"
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
         "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
         "Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        f"Style: Caption, {font}, {BASE_FS}, &H00FFFFFF, &H00FFFFFF, &H00101010, &H80202020, "
-        "1,0,0,0,100,100,0,0,1,10,5,2, "
-        f"{MARGIN_LR},{MARGIN_LR},{MARGIN_V_EFF},0\n"
-        f"Style: Emph, {fontB}, {EMPH_FS}, &H0000FFFF, &H00FFFFFF, &H00101010, &H80202020, "
-        "1,0,0,0,100,100,0,0,1,12,6,2, "
-        f"{MARGIN_LR},{MARGIN_LR},{MARGIN_V_EFF},0\n"
-        "\n"
-        "[Events]\n"
-        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+        f"Style: Caption,{getattr(CFG,'caption_font','Arial')},{BASE_FS},&H00FFFFFF,&H000000FF,&H00000000,&H64000000,0,0,0,0,100,100,0,0,1,4,0,2,{MARGIN_LR},{MARGIN_LR},{MARGIN_V},0\n"
+        f"Style: Emph,{getattr(CFG,'caption_font_emph','Arial Black')},{EMPH_FS},&H00FFFFFF,&H000000FF,&H00000000,&H64000000,1,0,0,0,100,100,0,0,1,4,0,2,{MARGIN_LR},{MARGIN_LR},{MARGIN_V},0\n\n"
+        "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
 
-def _ass_time(t: float) -> str:
-    if t < 0: t = 0
-    h = int(t // 3600); m = int((t % 3600) // 60); s = int(t % 60)
-    cs = int(round((t - int(t)) * 100))
-    return f"{h:d}:{m:02d}:{s:02d}.{cs:02d}"
-
-def _write_clip_ass(
-    transcript_segments: List[Dict[str, Any]],
-    clip_start: float,
-    clip_end: float,
-    ass_path: Path
-) -> List[Tuple[float, float]]:
-    """
-    Create ASS captions aligned to word timing (if available).
-    Chunks are split at pauses so text never lingers during silences.
-    """
-    all_words: List[Tuple[str, float, float]] = []
-    for seg in transcript_segments:
-        for (w, ws, we) in _extract_words(seg):
-            if we <= clip_start or ws >= clip_end:
-                continue
-            all_words.append((w, max(ws, clip_start), min(we, clip_end)))
-
-    lines = [_ass_header()]
-    punch_windows: List[Tuple[float, float]] = []
-
-    if not all_words:
-        ass_path.write_text("".join(lines), encoding="utf-8")
-        return punch_windows
-
-    # Sort words by time and split by gaps
-    all_words.sort(key=lambda x: x[1])
-    chunks_raw = _split_into_chunks_gap_aware(
-        all_words,
-        int(getattr(CFG, "chunk_min_words", 3)),
-        int(getattr(CFG, "chunk_max_words", 4)),
-        gap_thr=0.22
-    )
-
-    for ch in chunks_raw:
-        words = [w for (w, _, _) in ch]
-        # Use exact window: from first word start to last word end
-        t0 = ch[0][1] - clip_start
-        t1 = ch[-1][2] - clip_start
-        if t1 <= t0:
+    tokens: List[str] = []
+    for seg in segments:
+        s = float(seg.get("start", 0.0))
+        e = float(seg.get("end", 0.0))
+        if e < clip_start or s > clip_end:
             continue
+        if seg.get("words"):
+            for w in seg["words"]:
+                ws = float(w.get("start", s)); we = float(w.get("end", e))
+                if we < clip_start or ws > clip_end:
+                    continue
+                tokens.append((w.get("word") or w.get("text") or "").strip())
+        else:
+            text = (seg.get("text") or "").strip()
+            if text:
+                tokens += _WORD_RE.findall(text)
 
-        emp_idx = _pick_emphasis_index(words)
-        line_text = _format_chunk_line(words, emp_idx)
+    text = " ".join(t for t in tokens if t).upper()
+    # Simple layout: cap max chars per line
+    avg_char_w = CHAR_W_FACTOR * BASE_FS
+    SAFE_W = PLAY_W - 2 * MARGIN_LR
+    max_chars = max(12, int(SAFE_W / max(1.0, avg_char_w)))
+    words = text.split()
+    chunks: List[List[str]] = []
+    cur: List[str] = []
+    cur_len = 0
+    for w in words:
+        add = len(w) + (1 if cur else 0)
+        if cur_len + add > max_chars:
+            if cur: chunks.append(cur)
+            cur = [w]; cur_len = len(w)
+        else:
+            cur.append(w); cur_len += add
+    if cur: chunks.append(cur)
 
-        start = _ass_time(max(0.0, t0))
-        end   = _ass_time(t1)
-        lines.append(f"Dialogue: 0,{start},{end},Caption,,0000,0000,0000,,{line_text}\n")
+    t0, t1 = float(clip_start), float(clip_end)
+    T = max(0.1, t1 - t0)
+    total = sum(len(c) for c in chunks) or 1
 
-    ass_path.write_text("".join(lines), encoding="utf-8")
-    return punch_windows
+    lines: List[str] = [STYLE_HEADER]
+    acc = 0.0
+    for ch in chunks:
+        frac = len(ch) / total
+        dur = frac * T
+        s = t0 + acc; e = s + dur; acc += dur
+        if ch:
+            # emphasize longest token
+            idx = max(range(len(ch)), key=lambda i: len(ch[i]))
+            parts = []
+            for i, tok in enumerate(ch):
+                if i == idx:
+                    parts.append("{\\b1}" + tok + "{\\b0}")
+                else:
+                    parts.append(tok)
+            txt = " ".join(parts)
+            lines.append(f"Dialogue: 0,{_ass_time(s)},{_ass_time(e)},Caption,,0000,0000,0000,," + txt + "\n")
 
-# --------------------------- FFmpeg filter helpers ---------------------------
-_DRIVE_COLON = re.compile(r"^([A-Za-z]):/")
+    out_path.write_text("".join(lines), encoding="utf-8")
 
-def _subtitles_filter_arg(sub_path: Path) -> str:
-    p = sub_path.resolve().as_posix()
-    p = _DRIVE_COLON.sub(r"\1\:/" , p)
-    return f"subtitles=filename='{p}'"
-
+# --------------------------- Legacy blur path (only when active crop is False) ---------------------------
 def _build_portrait_vf() -> str:
     """
-    1080x1920 canvas with blurred background and centered foreground; mild enhancement.
+    Classic blurred-canvas portrait composition using gblur + overlay.
     """
     W = int(getattr(CFG, "portrait_width", 1080))
     H = int(getattr(CFG, "portrait_height", 1920))
-
-    if not bool(getattr(CFG, "enable_blur_bg", True)):
-        # Basic letterbox portrait without heavy blur
-        return (
-            f"scale={W}:-2:flags=lanczos,"
-            f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:black,"
-            f"eq=contrast={getattr(CFG,'color_contrast',1.08)}:"
-            f"saturation={getattr(CFG,'color_saturation',1.12)}:"
-            f"gamma={getattr(CFG,'color_gamma',1.03)}"
-        )
-
     sgm = float(getattr(CFG, "bg_blur_sigma", 24.0))
-    uLx, uLy = getattr(CFG, "unsharp_luma_msize", (5,5))
-    uLa      = float(getattr(CFG, "unsharp_luma_amount", 0.70))
-    uCx, uCy = getattr(CFG, "unsharp_chroma_msize", (5,5))
-    uCa      = float(getattr(CFG, "unsharp_chroma_amount", 0.00))
+    ccon = float(getattr(CFG, "color_contrast", 1.08))
+    csat = float(getattr(CFG, "color_saturation", 1.12))
+    cgam = float(getattr(CFG, "color_gamma", 1.03))
+    uLx, uLy = getattr(CFG, "unsharp_luma_msize", (5, 5))
+    uLa = float(getattr(CFG, "unsharp_luma_amount", 0.70))
+    uCx, uCy = getattr(CFG, "unsharp_chroma_msize", (5, 5))
+    uCa = float(getattr(CFG, "unsharp_chroma_amount", 0.00))
 
-    return (
-        f"split[bg][fg];"
+    vf = (
+        f"[0:v]split[bg][fg];"
         f"[bg]scale={W}:{H}:force_original_aspect_ratio=increase,"
-            f"crop={W}:{H},"
-            f"gblur=sigma={sgm}[bg];"
-        f"[fg]scale={W}:-2:flags=lanczos[fgs];"
-        f"[bg][fgs]overlay=(W-w)/2:(H-h)/2,"
-            f"eq=contrast={getattr(CFG,'color_contrast',1.08)}:"
-            f"saturation={getattr(CFG,'color_saturation',1.12)}:"
-            f"gamma={getattr(CFG,'color_gamma',1.03)},"
-            f"unsharp={uLx}:{uLy}:{uLa}:{uCx}:{uCy}:{uCa}"
+        f"crop={W}:{H},gblur=sigma={sgm}[bg2];"
+        f"[fg]scale={W}:-2:flags=lanczos[fg2];"
+        f"[bg2][fg2]overlay=(W-w)/2:(H-h)/2,"
+        f"eq=contrast={ccon}:saturation={csat}:gamma={cgam},"
+        f"unsharp={uLx}:{uLy}:{uLa}:{uCx}:{uCy}:{uCa}"
     )
-
-def _append_punch(vf: str, punch_windows: List[Tuple[float, float]]) -> str:
-    """
-    Previously applied time-windowed contrast/saturation boosts for emphasized words.
-    Now explicitly disabled per requirements.
-    """
     return vf
 
 # --------------------------- Public API ---------------------------
@@ -372,51 +191,133 @@ def cut_portrait_with_subs(
     out_dir: str
 ) -> str:
     """
-    Cut [start,end], convert to 1080x1920 with blurred background (no crop),
-    burn dynamic-fit CAPS captions aligned to word timing, export high quality.
-
-    NOW: Saves two outputs:
-      - <base>.mp4            (no subtitles)
-      - <base>_sub.mp4        (with subtitles)
-    Returns the path to the non-subtitled file (no other behavior changed).
+    Backward-compatible entry point.
+    Returns the path to the non-subtitled .mp4 (subtitled variant is also written with _sub suffix).
     """
+    inp = Path(input_video)
     out_dir_p = ensure_dir(out_dir)
-    inp = Path(input_video).resolve()
 
-    start = float(clip["start"]); end = float(clip["end"])
-    duration = max(0.1, end - start)
+    start = float(clip.get("start", 0.0))
+    end   = float(clip.get("end", 0.0))
+    if end <= start:
+        raise ValueError("Invalid clip range")
+    duration = end - start
 
-    # temp ASS
-    tmp_dir = Path(tempfile.mkdtemp(prefix="subs_"))
+    title = (clip.get("title") or "").strip()
+    caption = (clip.get("caption") or "").strip()
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="shorts_"))
     try:
-        # ASS name (temp)
-        ass_name = f"{safe_stem(inp.stem)}_{int(round(start))}_{int(round(end))}.ass"
-        ass_path = tmp_dir / ass_name
-        punch_windows = _write_clip_ass(transcript_segments, start, end, ass_path)
+        # 1) Write ASS subs for [start, end]
+        ass_path = tmp_dir / f"{safe_stem(inp.stem)}_{int(round(start))}_{int(round(end))}.ass"
+        _write_clip_ass(transcript_segments, start, end, ass_path)
 
-        core_vf = _build_portrait_vf()  # base portrait pipeline (no subs)
-        vf_sub = f"{core_vf},{_subtitles_filter_arg(ass_path)}"
-        vf_sub = _append_punch(vf_sub, punch_windows)  # no-op now
+        # 2) Choose video filter according to active-crop flag
+        use_active = bool(getattr(CFG, "enable_active_crop", False))
+        if use_active:
+            # Explicitly orchestrate each Active-Crop step
+            try:
+                from modules.active_crop import faces as ac_faces, asd as ac_asd, diar as ac_diar, fuser as ac_fuser, path as ac_path, render as ac_render
+            except Exception as e:
+                raise RuntimeError(f"[active-crop:init] import failed: {e}") from e
 
-        # Final filename pattern: title_with_underscores-caption_with_underscores.mp4
-        title = (clip.get("title") or "").strip()
-        caption = (clip.get("caption") or "").strip()
-        title_s = safe_stem(title.replace(" ", "_")) if title else safe_stem(inp.stem)
-        caption_s = safe_stem(caption.replace(" ", "_")) if caption else f"{int(round(start))}_{int(round(end))}"
-        base_name = f"{title_s}-{caption_s}"
+            play_w = int(getattr(CFG, "portrait_width", 1080) or 1080)
+            play_h = int(getattr(CFG, "portrait_height", 1920) or 1920)
+            margin = float(getattr(CFG, "active_crop_margin", 1.6))
+            headroom = float(getattr(CFG, "active_crop_headroom", 0.12))
+            smooth_alpha = float(getattr(CFG, "active_crop_smooth_alpha", 0.6))
 
-        # Paths: no-subs (original name) and subs (with _sub suffix)
+            # faces
+            try:
+                tracks, meta = ac_faces.extract_tracks(str(inp), start, end)
+            except Exception as e:
+                raise RuntimeError(f"[active-crop:faces.extract_tracks] {e}") from e
+            if not tracks:
+                raise RuntimeError("[active-crop:faces.extract_tracks] no faces tracked")
+
+            try:
+                W = int(meta.get("width") or 0)
+                H = int(meta.get("height") or 0)
+                fps_meta = float(meta.get("fps") or 25.0)
+            except Exception as e:
+                raise RuntimeError(f"[active-crop:faces.meta] invalid meta: {meta!r} ({e})") from e
+            if W <= 0 or H <= 0:
+                raise RuntimeError(f"[active-crop:faces.meta] invalid video dimensions: width={W}, height={H}")
+
+            # ASD (hybrid: landmarks → motion proxy fallback)
+            try:
+                asd_scores = ac_asd.score_lip_motion(
+                    str(inp), tracks, start, end,
+                    fps_hint=fps_meta,
+                    expand_factor=1.6,      # more context for landmarks
+                    motion_proxy=True       # keep scores even if landmarks fail
+                )
+            except Exception as e:
+                raise RuntimeError(f"[active-crop:asd.score_lip_motion] {e}") from e
+
+
+            # VAD / diarization
+            try:
+                vad = ac_diar.speech_regions(str(inp), start, end)
+            except Exception as e:
+                raise RuntimeError(f"[active-crop:diar.speech_regions] {e}") from e
+            if not vad:
+                raise RuntimeError("[active-crop:diar.speech_regions] no speech detected")
+
+            # Fuse
+            try:
+                fused = ac_fuser.fuse_asd_and_vad(asd_scores, vad, enter_thr=0.55, exit_thr=0.45, min_hold_ms=300)
+            except Exception as e:
+                raise RuntimeError(f"[active-crop:fuser.fuse_asd_and_vad] {e}") from e
+            if not fused:
+                raise RuntimeError("[active-crop:fuser.fuse_asd_and_vad] empty active-speaker segments")
+
+            # Schedule (robust path)
+            try:
+                schedule = ac_path.build_crop_schedule(
+                    fused=fused,
+                    tracks=tracks,
+                    W_in=W,
+                    H_in=H,
+                    play_w_in=play_w,
+                    play_h_in=play_h,
+                    margin_in=margin,
+                    headroom_in=headroom,
+                    smooth_alpha_in=smooth_alpha,
+                )
+            except Exception as e:
+                raise RuntimeError(f"[active-crop:path.build_crop_schedule] {e}") from e
+            if not schedule:
+                raise RuntimeError("[active-crop:path.build_crop_schedule] empty crop schedule")
+
+            # FFmpeg crop expr
+            try:
+                core_vf = ac_render.build_crop_vf(
+                    schedule,
+                    play_w,
+                    play_h,
+                    W,   # <- source width (int)
+                    H    # <- source height (int)
+                )
+            except Exception as e:
+                raise RuntimeError(f"[active-crop:render.build_crop_vf] {e}") from e
+
+        else:
+            core_vf = _build_portrait_vf()
+
+        # 3) Compose subtitles
+        vf_sub = f"{core_vf},{_ffmpeg_sub_path_arg(ass_path)}"
+
+        # 4) Output paths / encode
+        base_name = f"{safe_stem(title or inp.stem)}-{safe_stem(caption) if caption else f'{int(start)}_{int(end)}'}"
         out_path = out_dir_p / f"{base_name}.mp4"
         out_path_sub = out_dir_p / f"{base_name}_sub.mp4"
 
         ffmpeg_bin = str(getattr(CFG, "ffmpeg_path", "ffmpeg"))
-
-        # 1) Render WITHOUT subtitles (unchanged filename)
+        # clean version
         cmd_nosub = [
             ffmpeg_bin, "-y",
-            "-ss", f"{start:.3f}",
-            "-i", str(inp),
-            "-t", f"{duration:.3f}",
+            "-ss", f"{start:.3f}", "-i", str(inp), "-t", f"{duration:.3f}",
             "-vf", core_vf,
             "-c:v", str(getattr(CFG, "vcodec", "libx264")),
             "-preset", str(getattr(CFG, "preset", "slow")),
@@ -429,12 +330,10 @@ def cut_portrait_with_subs(
         ]
         subprocess.run(cmd_nosub, check=True)
 
-        # 2) Render WITH subtitles (adds _sub suffix)
+        # subtitled version
         cmd_sub = [
             ffmpeg_bin, "-y",
-            "-ss", f"{start:.3f}",
-            "-i", str(inp),
-            "-t", f"{duration:.3f}",
+            "-ss", f"{start:.3f}", "-i", str(inp), "-t", f"{duration:.3f}",
             "-vf", vf_sub,
             "-c:v", str(getattr(CFG, "vcodec", "libx264")),
             "-preset", str(getattr(CFG, "preset", "slow")),
@@ -447,93 +346,40 @@ def cut_portrait_with_subs(
         ]
         subprocess.run(cmd_sub, check=True)
 
-        # Keep return value identical to previous behavior (no-subs path)
         return str(out_path)
     finally:
-        try:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-        except Exception:
-            pass
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
+def render_all_clips(input_video: str, transcript: Dict[str, Any], clips: List[Dict[str, Any]], out_dir: str, verbose: bool = True) -> List[str]:
+    paths: List[str] = []
+    segs: List[Dict[str, Any]] = transcript.get("segments") or []
+    for clip in clips:
+        start = float(clip.get("start", 0.0)); end = float(clip.get("end", 0.0))
+        subset = [s for s in segs if not (float(s.get("end", 0.0)) < start or float(s.get("start", 0.0)) > end)]
+        p = cut_portrait_with_subs(input_video, subset, clip, out_dir)
+        paths.append(p)
+    return paths
 
-def render_all_clips(video_path: str,
-                     transcript: Dict[str, Any],
-                     clips: List[Dict[str, Any]],
-                     out_dir: str,
-                     verbose: bool | None = None):
-    """
-    Render each planned clip; captions come from the (transliterated) transcript's word timings.
-    """
-    if verbose is None:
-        verbose = bool(getattr(CFG, "verbose", True))
-
-    os.makedirs(out_dir, exist_ok=True)
-
-    total = len(clips)
-    if total == 0:
-        step("[RND] No clips to render.", verbose)
-        return []
-
-    step(f"[RND] Rendering {total} clips → {out_dir}", verbose)
-    t0 = time.time()
-    done_paths: List[str] = []
-
-    segs = list(transcript.get("segments") or [])
-    if not segs:
-        raise RuntimeError("Transcript has no segments; cannot create word-timed subtitles.")
-
-    for idx, clip in enumerate(clips, start=1):
-        start = float(clip.get("start", 0.0))
-        end   = float(clip.get("end", 0.0))
-        title = (clip.get("title") or "")[:60]
-        step(f"[RND] clip {idx}/{total}  {start:.2f}s → {end:.2f}s  title='{title}'", verbose)
-
-        try:
-            out_path = cut_portrait_with_subs(video_path, segs, clip, out_dir)
-        except subprocess.CalledProcessError as e:
-            step(f"[RND] ffmpeg failed on clip {idx}: {e}", True)
-            continue
-
-        done_paths.append(out_path)
-
-        # coarse across-clips ETA
-        elapsed_total = time.time() - t0
-        avg = elapsed_total / idx
-        eta = avg * (total - idx)
-        step(f"[RND] progress {idx}/{total}  elapsed={elapsed_total:5.1f}s  eta={eta:5.1f}s", verbose)
-
-    step(f"[RND] Completed {len(done_paths)}/{total} clips. Total time: {time.time()-t0:5.1f}s", verbose)
-    return done_paths
-
-# --------------------------- CLI ---------------------------
-
-# === Added for coherent path-based orchestration ===
-def render_from_paths(video_path: str,
-                      transcript_json_path: str,
-                      plan_json_path: str,
-                      out_dir: str,
-                      verbose: bool = True) -> list[str]:
-    """Load transcript and plan from their paths, render all clips, and return output paths."""
+def render_from_paths(video_path: str, transcript_json_path: str, plan_json_path: str, out_dir: str, verbose: bool = True) -> List[str]:
     with open(transcript_json_path, "r", encoding="utf-8") as f:
         transcript = json.load(f)
     with open(plan_json_path, "r", encoding="utf-8") as f:
-        pj = json.load(f)
-    clips = pj.get("clips", [])
-    return render_all_clips(video_path, transcript, clips, out_dir, verbose=verbose)
-
+        plan = json.load(f)
+    return render_all_clips(video_path, transcript, plan.get("clips", []), out_dir, verbose=verbose)
 
 if __name__ == "__main__":
     import argparse
-    ap = argparse.ArgumentParser(description="Render portrait shorts with dynamic-fit captions (word-timed) and blurred background")
-    ap.add_argument("--video", required=True, help="Path to source video")
-    ap.add_argument("--transcript", required=True, help="Path to transliterated transcript JSON (…_roman.json)")
-    ap.add_argument("--plan", required=True, help="Path to clip plan JSON (expects 'title' and 'caption' per clip)")
-    ap.add_argument("--out", default="finalized_shorts", help="Output folder for shorts")
+    ap = argparse.ArgumentParser(description="Render portrait shorts; active-crop optionally enabled")
+    ap.add_argument("--video", required=True)
+    ap.add_argument("--transcript", required=True)
+    ap.add_argument("--plan", required=True)
+    ap.add_argument("--out", default="finalized_shorts")
+    ap.add_argument("--active", action="store_true")
     args = ap.parse_args()
-
+    if args.active:
+        try: setattr(CFG, "enable_active_crop", True)
+        except Exception: pass
     transcript = json.loads(Path(args.transcript).read_text(encoding="utf-8"))
     plan = json.loads(Path(args.plan).read_text(encoding="utf-8"))
-    clips = plan.get("clips", [])
-    paths = render_all_clips(args.video, transcript, clips, args.out, verbose=VERBOSE)
-    for p in paths:
-        print(f"short={p}")
+    for p in render_all_clips(args.video, transcript, plan.get("clips", []), args.out, verbose=VERBOSE):
+        print("short=", p)
