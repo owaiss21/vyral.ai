@@ -1,23 +1,30 @@
 from __future__ import annotations
 from typing import List, Tuple
 
-def _between_expr(s: float, e: float) -> str:
-    # Escape commas so FFmpeg doesn't split the filter graph
-    return f"between(t\\,{s:.3f}\\,{e:.3f})"
+# schedule items are tuples: (start, end, x, y, w, h)
 
-def _sum_of_products(pieces: List[Tuple[float, float, float]], default_val: float) -> str:
+def _fmtf(v: float) -> str:
+    # stable float formatting for ffmpeg expressions
+    return f"{float(v):.6f}"
+
+def _between(s: float, e: float) -> str:
+    # Escape commas for ffmpeg filter arg lists
+    return f"between(t\\,{_fmtf(s)}\\,{_fmtf(e)})"
+
+def _sum_gated(pieces: List[Tuple[float, float, float]], default_val: float) -> str:
     """
-    Returns: (v1*between(...) + v2*between(...) + ... + default_val)
+    Build a time-gated sum: sum(v_i * between(t, s_i, e_i)), with fallback default if none active.
+    Returns an expression that equals default_val when no piece is active.
     """
-    terms = [f"({v:.3f})*{_between_expr(s, e)}" for (s, e, v) in pieces]
-    terms.append(f"({default_val:.3f})")
-    return "(" + "+".join(terms) + ")"
+    if not pieces:
+        return _fmtf(default_val)
 
-def _min(a: str, b: str) -> str:
-    return f"min({a}\\,{b})"
-
-def _max(a: str, b: str) -> str:
-    return f"max({a}\\,{b})"
+    terms = [f"({_fmtf(v)})*{_between(s, e)}" for (s, e, v) in pieces]
+    mask_terms = [f"{_between(s, e)}" for (s, e, _) in pieces]
+    sum_terms = "(" + "+".join(terms) + ")"
+    sum_masks = "(" + "+".join(mask_terms) + ")"
+    # default when none active: default_val * (1 - gt(sum_masks, 0))
+    return f"({sum_terms}) + ({_fmtf(default_val)})*(1-gt({sum_masks}\\,0))"
 
 def build_crop_vf(
     schedule: List[Tuple[float, float, float, float, float, float]],
@@ -27,53 +34,76 @@ def build_crop_vf(
     src_h: int,
 ) -> str:
     """
-    Build a safe crop expression that:
-      - selects (x,y,w,h) by time with sum-of-products gates,
-      - clamps w,h to [2 .. src_w/src_h],
-      - clamps x,y to keep the crop fully inside the source,
-      - always valid even when no schedule piece matches at some t.
+    Build a robust -vf chain that:
+      1) Crops to the schedule-proposed window (time varying, inside the source; no padding).
+      2) setsar=1 to avoid display squeeze.
+      3) Scales to COVER a 9:16 canvas without changing AR.
+      4) Crops to exactly play_w x play_h (no bars, no blur).
 
-    Returns a single -vf string ending with scale=play_w:play_h.
+    The result is a true crop-only portrait with zero stretch.
+
+    schedule: list of (start, end, x, y, w, h)
+    play_w, play_h: desired portrait frame (e.g., 1080x1920)
+    src_w, src_h: source frame dimensions
     """
+
+    # target aspect
+    A = float(play_w) / float(play_h)  # e.g., 9/16
+
     if not schedule:
-        raise RuntimeError("empty crop schedule")
+        # Max 9:16 inside source, centered
+        return (
+            "crop="
+            f"w='if(gte(iw/ih,{A:.9f}),ih*{A:.9f},iw)':"
+            f"h='if(gte(iw/ih,{A:.9f}),ih,iw/{A:.9f})':"
+            "x='(iw-w)/2':"
+            "y='(ih-h)/2',"
+            "setsar=1,"
+            f"scale='if(gte(a\\,{A:.9f}),-2,{play_w})':'if(gte(a\\,{A:.9f}),{play_h},-2)':flags=lanczos,"
+            f"crop={play_w}:{play_h}"
+        )
 
-    x_p: List[Tuple[float, float, float]] = []
-    y_p: List[Tuple[float, float, float]] = []
-    w_p: List[Tuple[float, float, float]] = []
-    h_p: List[Tuple[float, float, float]] = []
+    # Build time-gated raw x, y, w, h from schedule
+    xs = [(s, e, x) for (s, e, x, y, w, h) in schedule]
+    ys = [(s, e, y) for (s, e, x, y, w, h) in schedule]
+    ws = [(s, e, w) for (s, e, x, y, w, h) in schedule]
+    hs = [(s, e, h) for (s, e, x, y, w, h) in schedule]
 
-    for (s, e, x, y, w, h) in schedule:
-        x_p.append((s, e, float(x)))
-        y_p.append((s, e, float(y)))
-        w_p.append((s, e, float(w)))
-        h_p.append((s, e, float(h)))
+    # Defaults if none active at a time: center a maximal portrait box inside the source
+    default_h = min(float(src_h), float(src_w) / A)
+    default_w = default_h * A
+    default_x = (float(src_w) - default_w) * 0.5
+    default_y = (float(src_h) - default_h) * 0.5
 
-    # Defaults when no interval is active at t
-    def_w = float(min(play_w, src_w))
-    def_h = float(min(play_h, src_h))
-    def_x = 0.0
-    def_y = 0.0
+    x_raw = _sum_gated(xs, default_x)
+    y_raw = _sum_gated(ys, default_y)
+    w_raw = _sum_gated(ws, default_w)
+    h_raw = _sum_gated(hs, default_h)
 
-    # Raw time-gated expressions
-    x_raw = _sum_of_products(x_p, default_val=def_x)
-    y_raw = _sum_of_products(y_p, default_val=def_y)
-    w_raw = _sum_of_products(w_p, default_val=def_w)
-    h_raw = _sum_of_products(h_p, default_val=def_h)
+    # Clamp w/h to source size
+    w_clamped = f"min({w_raw}\\,{src_w})"
+    h_clamped = f"min({h_raw}\\,{src_h})"
 
-    # Clamp widths/heights to be inside the source and >= 2
-    w_clamped = _min(str(src_w), _max("2", w_raw))
-    h_clamped = _min(str(src_h), _max("2", h_raw))
+    # Clamp x/y so the crop rectangle stays inside the source
+    x_right_limit = f"({src_w})-({w_clamped})"
+    y_bottom_limit = f"({src_h})-({h_clamped})"
+    x_clamped = f"max(0\\,min(({x_raw})\\,{x_right_limit}))"
+    y_clamped = f"max(0\\,min(({y_raw})\\,{y_bottom_limit}))"
 
-    # Clamp positions so the crop stays fully inside the frame
-    # x_clamped = max(0, min(x_raw, src_w - w_clamped))
-    # y_clamped = max(0, min(y_raw, src_h - h_clamped))
-    x_inner = _min(x_raw, f"{src_w}-{w_clamped}")
-    x_clamped = _max("0", x_inner)
-    y_inner = _min(y_raw, f"{src_h}-{h_clamped}")
-    y_clamped = _max("0", y_inner)
-
-    return (
-        f"crop=floor({w_clamped}):floor({h_clamped}):floor({x_clamped}):floor({y_clamped}),"
-        f"scale={int(play_w)}:{int(play_h)}"
+    # Final chain:
+    #  1) Crop to scheduled window (no padding)
+    #  2) setsar=1
+    #  3) Scale to cover target AR without stretching (branch on current a vs A)
+    #  4) Crop to exact play_w x play_h
+    vf = (
+        "crop="
+        f"floor({w_clamped}):"
+        f"floor({h_clamped}):"
+        f"floor({x_clamped}):"
+        f"floor({y_clamped}),"
+        "setsar=1,"
+        f"scale='if(gte(a\\,{A:.9f}),-2,{play_w})':'if(gte(a\\,{A:.9f}),{play_h},-2)':flags=lanczos,"
+        f"crop={play_w}:{play_h}"
     )
+
+    return vf

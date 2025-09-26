@@ -39,7 +39,7 @@ except Exception:
         acodec = "aac"
         audio_bitrate_kbps = 192
         # Active crop control
-        enable_active_crop = False
+        enable_active_crop = True   # default ON per your request
         active_crop_margin = 1.6
         active_crop_headroom = 0.12
         active_crop_smooth_alpha = 0.6
@@ -61,7 +61,7 @@ def safe_stem(s: str) -> str:
 def _ffmpeg_sub_path_arg(sub_path: Path) -> str:
     # Convert Windows "C:/..." to "C\:/..." for FFmpeg
     p = sub_path.resolve().as_posix()
-    p = _DRIVE_COLON.sub(r"\1\:/", p)
+    p = _DRIVE_COLON.sub(r"\1\:/", p)  # <-- FIX: single backslash, expands \1 to drive letter
     return f"subtitles=filename='{p}'"
 
 # --------------------------- ASS subtitles ---------------------------
@@ -132,9 +132,9 @@ def _write_clip_ass(segments: List[Dict[str, Any]], clip_start: float, clip_end:
             cur.append(w); cur_len += add
     if cur: chunks.append(cur)
 
+    total = sum(len(c) for c in chunks) or 1
     t0, t1 = float(clip_start), float(clip_end)
     T = max(0.1, t1 - t0)
-    total = sum(len(c) for c in chunks) or 1
 
     lines: List[str] = [STYLE_HEADER]
     acc = 0.0
@@ -143,24 +143,16 @@ def _write_clip_ass(segments: List[Dict[str, Any]], clip_start: float, clip_end:
         dur = frac * T
         s = t0 + acc; e = s + dur; acc += dur
         if ch:
-            # emphasize longest token
             idx = max(range(len(ch)), key=lambda i: len(ch[i]))
             parts = []
             for i, tok in enumerate(ch):
-                if i == idx:
-                    parts.append("{\\b1}" + tok + "{\\b0}")
-                else:
-                    parts.append(tok)
+                parts.append("{\\b1}"+tok+"{\\b0}" if i == idx else tok)
             txt = " ".join(parts)
             lines.append(f"Dialogue: 0,{_ass_time(s)},{_ass_time(e)},Caption,,0000,0000,0000,," + txt + "\n")
-
     out_path.write_text("".join(lines), encoding="utf-8")
 
-# --------------------------- Legacy blur path (only when active crop is False) ---------------------------
-def _build_portrait_vf() -> str:
-    """
-    Classic blurred-canvas portrait composition using gblur + overlay.
-    """
+# --------------------------- Legacy blur path (active_crop=False) ---------------------------
+def _build_portrait_vf_legacy() -> str:
     W = int(getattr(CFG, "portrait_width", 1080))
     H = int(getattr(CFG, "portrait_height", 1920))
     sgm = float(getattr(CFG, "bg_blur_sigma", 24.0))
@@ -172,16 +164,16 @@ def _build_portrait_vf() -> str:
     uCx, uCy = getattr(CFG, "unsharp_chroma_msize", (5, 5))
     uCa = float(getattr(CFG, "unsharp_chroma_amount", 0.00))
 
-    vf = (
+    return (
         f"[0:v]split[bg][fg];"
         f"[bg]scale={W}:{H}:force_original_aspect_ratio=increase,"
         f"crop={W}:{H},gblur=sigma={sgm}[bg2];"
         f"[fg]scale={W}:-2:flags=lanczos[fg2];"
         f"[bg2][fg2]overlay=(W-w)/2:(H-h)/2,"
         f"eq=contrast={ccon}:saturation={csat}:gamma={cgam},"
-        f"unsharp={uLx}:{uLy}:{uLa}:{uCx}:{uCy}:{uCa}"
+        f"unsharp={uLx}:{uLy}:{uLa}:{uCx}:{uCy}:{uCa},"
+        f"setsar=1"
     )
-    return vf
 
 # --------------------------- Public API ---------------------------
 def cut_portrait_with_subs(
@@ -190,15 +182,10 @@ def cut_portrait_with_subs(
     clip: Dict[str, Any],
     out_dir: str
 ) -> str:
-    """
-    Backward-compatible entry point.
-    Returns the path to the non-subtitled .mp4 (subtitled variant is also written with _sub suffix).
-    """
     inp = Path(input_video)
     out_dir_p = ensure_dir(out_dir)
 
-    start = float(clip.get("start", 0.0))
-    end   = float(clip.get("end", 0.0))
+    start = float(clip.get("start", 0.0)); end = float(clip.get("end", 0.0))
     if end <= start:
         raise ValueError("Invalid clip range")
     duration = end - start
@@ -208,14 +195,13 @@ def cut_portrait_with_subs(
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="shorts_"))
     try:
-        # 1) Write ASS subs for [start, end]
+        # 1) ASS for this clip window (built from transcript JSON)
         ass_path = tmp_dir / f"{safe_stem(inp.stem)}_{int(round(start))}_{int(round(end))}.ass"
         _write_clip_ass(transcript_segments, start, end, ass_path)
 
-        # 2) Choose video filter according to active-crop flag
-        use_active = bool(getattr(CFG, "enable_active_crop", False))
+        # 2) Filter chain
+        use_active = bool(getattr(CFG, "enable_active_crop", True))
         if use_active:
-            # Explicitly orchestrate each Active-Crop step
             try:
                 from modules.active_crop import faces as ac_faces, asd as ac_asd, diar as ac_diar, fuser as ac_fuser, path as ac_path, render as ac_render
             except Exception as e:
@@ -227,11 +213,8 @@ def cut_portrait_with_subs(
             headroom = float(getattr(CFG, "active_crop_headroom", 0.12))
             smooth_alpha = float(getattr(CFG, "active_crop_smooth_alpha", 0.6))
 
-            # faces
-            try:
-                tracks, meta = ac_faces.extract_tracks(str(inp), start, end)
-            except Exception as e:
-                raise RuntimeError(f"[active-crop:faces.extract_tracks] {e}") from e
+            # Face tracks + meta
+            tracks, meta = ac_faces.extract_tracks(str(inp), start, end)
             if not tracks:
                 raise RuntimeError("[active-crop:faces.extract_tracks] no faces tracked")
 
@@ -244,77 +227,48 @@ def cut_portrait_with_subs(
             if W <= 0 or H <= 0:
                 raise RuntimeError(f"[active-crop:faces.meta] invalid video dimensions: width={W}, height={H}")
 
-            # ASD (hybrid: landmarks → motion proxy fallback)
-            try:
-                asd_scores = ac_asd.score_lip_motion(
-                    str(inp), tracks, start, end,
-                    fps_hint=fps_meta,
-                    expand_factor=1.6,      # more context for landmarks
-                    motion_proxy=True       # keep scores even if landmarks fail
-                )
-            except Exception as e:
-                raise RuntimeError(f"[active-crop:asd.score_lip_motion] {e}") from e
+            # Lip motion proxy (ASD)
+            asd_scores = ac_asd.score_lip_motion(
+                str(inp), tracks, start, end,
+                fps_hint=fps_meta, expand_factor=1.6, motion_proxy=True
+            )
 
-
-            # VAD / diarization
-            try:
-                vad = ac_diar.speech_regions(str(inp), start, end)
-            except Exception as e:
-                raise RuntimeError(f"[active-crop:diar.speech_regions] {e}") from e
+            # VAD
+            vad = ac_diar.speech_regions(str(inp), start, end)
             if not vad:
                 raise RuntimeError("[active-crop:diar.speech_regions] no speech detected")
 
             # Fuse
-            try:
-                fused = ac_fuser.fuse_asd_and_vad(asd_scores, vad, enter_thr=0.55, exit_thr=0.45, min_hold_ms=300)
-            except Exception as e:
-                raise RuntimeError(f"[active-crop:fuser.fuse_asd_and_vad] {e}") from e
+            fused = ac_fuser.fuse_asd_and_vad(asd_scores, vad, enter_thr=0.55, exit_thr=0.45, min_hold_ms=300)
             if not fused:
                 raise RuntimeError("[active-crop:fuser.fuse_asd_and_vad] empty active-speaker segments")
 
-            # Schedule (robust path)
-            try:
-                schedule = ac_path.build_crop_schedule(
-                    fused=fused,
-                    tracks=tracks,
-                    W_in=W,
-                    H_in=H,
-                    play_w_in=play_w,
-                    play_h_in=play_h,
-                    margin_in=margin,
-                    headroom_in=headroom,
-                    smooth_alpha_in=smooth_alpha,
-                )
-            except Exception as e:
-                raise RuntimeError(f"[active-crop:path.build_crop_schedule] {e}") from e
+            # 9:16 schedule centered on speaker but clamped to frame
+            schedule = ac_path.build_crop_schedule(
+                fused=fused, tracks=tracks, W_in=W, H_in=H,
+                play_w_in=play_w, play_h_in=play_h,
+                margin_in=margin, headroom_in=headroom, smooth_alpha_in=smooth_alpha
+            )
             if not schedule:
                 raise RuntimeError("[active-crop:path.build_crop_schedule] empty crop schedule")
 
-            # FFmpeg crop expr
-            try:
-                core_vf = ac_render.build_crop_vf(
-                    schedule,
-                    play_w,
-                    play_h,
-                    W,   # <- source width (int)
-                    H    # <- source height (int)
-                )
-            except Exception as e:
-                raise RuntimeError(f"[active-crop:render.build_crop_vf] {e}") from e
+            # Build a cover-scale + exact 9:16 crop (no bars, no stretch)
+            core_vf = ac_render.build_crop_vf(schedule, play_w, play_h, W, H)
 
         else:
-            core_vf = _build_portrait_vf()
+            # Legacy blur composition (landscape kept; blur fills)
+            core_vf = _build_portrait_vf_legacy()
 
-        # 3) Compose subtitles
+        # 3) Compose subtitles on the final canvas
         vf_sub = f"{core_vf},{_ffmpeg_sub_path_arg(ass_path)}"
 
-        # 4) Output paths / encode
+        # 4) Output/encode
         base_name = f"{safe_stem(title or inp.stem)}-{safe_stem(caption) if caption else f'{int(start)}_{int(end)}'}"
         out_path = out_dir_p / f"{base_name}.mp4"
         out_path_sub = out_dir_p / f"{base_name}_sub.mp4"
 
         ffmpeg_bin = str(getattr(CFG, "ffmpeg_path", "ffmpeg"))
-        # clean version
+
         cmd_nosub = [
             ffmpeg_bin, "-y",
             "-ss", f"{start:.3f}", "-i", str(inp), "-t", f"{duration:.3f}",
@@ -323,6 +277,7 @@ def cut_portrait_with_subs(
             "-preset", str(getattr(CFG, "preset", "slow")),
             "-crf", str(getattr(CFG, "crf", 16)),
             "-pix_fmt", str(getattr(CFG, "pix_fmt", "yuv420p")),
+            "-metadata:s:v:0", "rotate=0",
             "-c:a", str(getattr(CFG, "acodec", "aac")),
             "-b:a", f"{int(getattr(CFG, 'audio_bitrate_kbps', 192))}k",
             "-movflags", "+faststart",
@@ -330,7 +285,6 @@ def cut_portrait_with_subs(
         ]
         subprocess.run(cmd_nosub, check=True)
 
-        # subtitled version
         cmd_sub = [
             ffmpeg_bin, "-y",
             "-ss", f"{start:.3f}", "-i", str(inp), "-t", f"{duration:.3f}",
@@ -339,6 +293,7 @@ def cut_portrait_with_subs(
             "-preset", str(getattr(CFG, "preset", "slow")),
             "-crf", str(getattr(CFG, "crf", 16)),
             "-pix_fmt", str(getattr(CFG, "pix_fmt", "yuv420p")),
+            "-metadata:s:v:0", "rotate=0",
             "-c:a", str(getattr(CFG, "acodec", "aac")),
             "-b:a", f"{int(getattr(CFG, 'audio_bitrate_kbps', 192))}k",
             "-movflags", "+faststart",
@@ -369,16 +324,19 @@ def render_from_paths(video_path: str, transcript_json_path: str, plan_json_path
 
 if __name__ == "__main__":
     import argparse
-    ap = argparse.ArgumentParser(description="Render portrait shorts; active-crop optionally enabled")
+    ap = argparse.ArgumentParser(description="Render portrait shorts; active-crop ON by default")
     ap.add_argument("--video", required=True)
     ap.add_argument("--transcript", required=True)
     ap.add_argument("--plan", required=True)
     ap.add_argument("--out", default="finalized_shorts")
-    ap.add_argument("--active", action="store_true")
+    ap.add_argument("--legacy", action="store_true", help="Disable active-crop and use legacy blur canvas")
     args = ap.parse_args()
-    if args.active:
-        try: setattr(CFG, "enable_active_crop", True)
-        except Exception: pass
+
+    try:
+        setattr(CFG, "enable_active_crop", not bool(args.legacy))
+    except Exception:
+        pass
+
     transcript = json.loads(Path(args.transcript).read_text(encoding="utf-8"))
     plan = json.loads(Path(args.plan).read_text(encoding="utf-8"))
     for p in render_all_clips(args.video, transcript, plan.get("clips", []), args.out, verbose=VERBOSE):
