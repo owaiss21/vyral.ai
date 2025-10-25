@@ -1,0 +1,48 @@
+[Script Info]
+ScriptType: v4.00+
+PlayResX: 1080
+PlayResY: 1920
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Caption,Arial,92,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,0,0,0,0,100,100,0,0,1,4,0,2,80,80,180,0
+Style: Emph,Arial Black,112,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,1,0,0,0,100,100,0,0,1,4,0,2,80,80,180,0
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:02:55.74,0:02:56.39,Caption,,0000,0000,0000,,YA {\b1}IRREGULAR{\b0}
+Dialogue: 0,0:02:56.39,0:02:57.36,Caption,,0000,0000,0000,,{\b1}WARFARE{\b0} HOTI HOTI
+Dialogue: 0,0:02:57.36,0:02:58.33,Caption,,0000,0000,0000,,HAI {\b1}TERRORIST{\b0} KE
+Dialogue: 0,0:02:58.33,0:02:59.30,Caption,,0000,0000,0000,,{\b1}AGAINST{\b0} WOH BHI
+Dialogue: 0,0:02:59.30,0:02:59.95,Caption,,0000,0000,0000,,{\b1}OPERATION{\b0} HOTE
+Dialogue: 0,0:02:59.95,0:03:00.92,Caption,,0000,0000,0000,,HAIN {\b1}MAGAR{\b0} IN
+Dialogue: 0,0:03:00.92,0:03:01.89,Caption,,0000,0000,0000,,TAMAM {\b1}OPERATION{\b0} KE
+Dialogue: 0,0:03:01.89,0:03:03.18,Caption,,0000,0000,0000,,{\b1}DORAN{\b0} EK LEVEL AF
+Dialogue: 0,0:03:03.18,0:03:03.83,Caption,,0000,0000,0000,,{\b1}COORDINATION{\b0} JO
+Dialogue: 0,0:03:03.83,0:03:05.12,Caption,,0000,0000,0000,,HAI WOH HONA {\b1}BOHAT{\b0}
+Dialogue: 0,0:03:05.12,0:03:06.42,Caption,,0000,0000,0000,,{\b1}ZARURI{\b0} HAI NA SIRF
+Dialogue: 0,0:03:06.42,0:03:07.71,Caption,,0000,0000,0000,,KENO {\b1}FORCES{\b0} KI BHI
+Dialogue: 0,0:03:07.71,0:03:08.36,Caption,,0000,0000,0000,,{\b1}BOHAT{\b0} KEH
+Dialogue: 0,0:03:08.36,0:03:08.68,Caption,,0000,0000,0000,,{\b1}INTELLIGENCE{\b0}
+Dialogue: 0,0:03:08.68,0:03:09.66,Caption,,0000,0000,0000,,{\b1}SERVICES{\b0} KI BHI
+Dialogue: 0,0:03:09.66,0:03:10.30,Caption,,0000,0000,0000,,{\b1}BECAUSE{\b0} WOH
+Dialogue: 0,0:03:10.30,0:03:10.63,Caption,,0000,0000,0000,,{\b1}INTELLIGENCE{\b0}
+Dialogue: 0,0:03:10.63,0:03:11.60,Caption,,0000,0000,0000,,{\b1}PROVIDE{\b0} KARTI HAIN
+Dialogue: 0,0:03:11.60,0:03:12.89,Caption,,0000,0000,0000,,AUR IS KE {\b1}MUTABIQ{\b0}
+Dialogue: 0,0:03:12.89,0:03:14.19,Caption,,0000,0000,0000,,{\b1}JITNE{\b0} AAP KE PLANS
+Dialogue: 0,0:03:14.19,0:03:15.48,Caption,,0000,0000,0000,,{\b1}BANE{\b0} HOTE HAIN UN
+Dialogue: 0,0:03:15.48,0:03:16.45,Caption,,0000,0000,0000,,KI {\b1}EXECUTION{\b0} HOTI
+Dialogue: 0,0:03:16.45,0:03:17.75,Caption,,0000,0000,0000,,{\b1}HAI{\b0} AUR JAB TAK
+Dialogue: 0,0:03:17.75,0:03:18.72,Caption,,0000,0000,0000,,WOH {\b1}SYNERGY{\b0} NAHI
+Dialogue: 0,0:03:18.72,0:03:19.69,Caption,,0000,0000,0000,,HOGI TAMAM {\b1}FORCES{\b0}
+Dialogue: 0,0:03:19.69,0:03:20.98,Caption,,0000,0000,0000,,{\b1}MEIN{\b0} IN PLAN KI
+Dialogue: 0,0:03:20.98,0:03:21.63,Caption,,0000,0000,0000,,{\b1}EFFECTIVE{\b0} TAREEQE
+Dialogue: 0,0:03:21.63,0:03:22.60,Caption,,0000,0000,0000,,SE AUR {\b1}SUCCESSFUL{\b0}
+Dialogue: 0,0:03:22.60,0:03:23.25,Caption,,0000,0000,0000,,{\b1}TAREEQE{\b0} SE
+Dialogue: 0,0:03:23.25,0:03:24.22,Caption,,0000,0000,0000,,{\b1}EXECUTION{\b0} NAHI HO
+Dialogue: 0,0:03:24.22,0:03:25.19,Caption,,0000,0000,0000,,{\b1}SAKTI{\b0} LEKIN JIS
+Dialogue: 0,0:03:25.19,0:03:26.48,Caption,,0000,0000,0000,,{\b1}TARAH{\b0} MEIN NE AAP
+Dialogue: 0,0:03:26.48,0:03:27.45,Caption,,0000,0000,0000,,KO {\b1}BATAYA{\b0} KE
+Dialogue: 0,0:03:27.45,0:03:28.10,Caption,,0000,0000,0000,,LEVELS {\b1}DIFFERENT{\b0}
+Dialogue: 0,0:03:28.10,0:03:29.40,Caption,,0000,0000,0000,,{\b1}HOTE{\b0} HAIN WAR KA
+Dialogue: 0,0:03:29.40,0:03:29.72,Caption,,0000,0000,0000,,{\b1}LEVELS{\b0}
