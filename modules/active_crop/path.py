@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any, Optional
 import math
 
 def _as_int(x, name: str) -> int:
@@ -29,140 +29,186 @@ def build_crop_schedule(
     H_in: int | float | None,
     play_w_in: int | float | None,
     play_h_in: int | float | None,
-    margin_in: float | None = 1.6,         # kept for API compatibility (unused in portrait-full-height mode)
-    headroom_in: float | None = 0.12,      # kept for API compatibility (unused here)
-    smooth_alpha_in: float | None = 0.6,   # kept for API compatibility (unused here)
+    margin_in: float | None = 1.6,         # kept for API compatibility (unused)
+    headroom_in: float | None = 0.12,      # kept for API compatibility (unused)
+    smooth_alpha_in: float | None = 0.6,   # EMA smoothing for cx
 ) -> List[Tuple[float, float, float, float, float, float]]:
     """
-    Build a crop schedule that ALWAYS produces 9:16 portrait windows using the FULL source height.
-    Logic:
-      - h = H (full height)
-      - w = floor(H * 9 / 16)
-      - For each interval [s,e] and track id, compute the face box nearest to time s (or last before s).
-      - Center the crop horizontally at the face center x; clamp to [0, W - w]; set y = 0.
-      - If fused is empty, create one interval covering the min..max time seen in tracks, centered on the
-        most supported track (largest number of boxes). This keeps active-crop semantics without blur fallback.
+    Build a dynamic crop schedule that is "throttled" to prevent
+    overly long FFmpeg filter strings.
+    
+    Logic (Throttled EMA):
+      - h = H (full height), w = floor(H * 9 / 16)
+      - Create a timeline of events (speaker changes).
+      - Add new time points every 100ms (MIN_STEP_MS) during speech.
+      - At each time point, find the nearest face (cx) for the active speaker.
+      - Apply EMA smoothing to this cx value.
+      - This creates a schedule that is smooth but sparse, fixing WinError 206.
 
     Returns: List[(t0, t1, x, y, w, h)]
     """
     # Source / target geometry
     W  = _as_int(W_in, "source width W")
     H  = _as_int(H_in, "source height H")
-    _  = _as_int(play_w_in, "portrait width play_w")   # only validated; not used to compute crop
-    __ = _as_int(play_h_in, "portrait height play_h")  # only validated; not used to compute crop
+    _  = _as_int(play_w_in, "portrait width play_w")
+    __ = _as_int(play_h_in, "portrait height play_h")
     if W <= 0 or H <= 0:
         raise ValueError(f"invalid source dimensions W={W}, H={H}")
 
     # Portrait crop using full height
     crop_h = float(H)
-    crop_w = float(max(2, min(W, int(round(H * 9.0 / 16.0)))))  # clamp width to source width
-    # If the source is already narrower than 9:16, keep crop_w = W (rare for landscape inputs)
+    crop_w = float(max(2, min(W, int(round(H * 9.0 / 16.0)))))
+    default_cx = W / 2.0
+    
+    alpha = max(0.0, min(0.98, float(smooth_alpha_in or 0.6)))
 
-    # Build track map (sorted by time, cleaned)
+    # Build track map (raw face boxes, sorted by time)
     tmap: Dict[int, List[Tuple[float, float, float, float, float]]] = {}
     for tr in tracks or []:
         tid = int(tr.get("id"))
         cleaned: List[Tuple[float, float, float, float, float]] = []
         for box in tr.get("boxes") or []:
-            if box is None or len(box) != 5:
-                continue
-            tb, x, y, w, h = box
+            if box is None or len(box) != 5: continue
             try:
-                tb = _as_float(tb, "box.t")
-                x  = _as_float(x,  "box.x")
-                y  = _as_float(y,  "box.y")
-                w  = _as_float(w,  "box.w")
-                h  = _as_float(h,  "box.h")
+                tb, x, y, w, h = [_as_float(v, "box.val") for v in box]
             except Exception:
                 continue
-            if w <= 1 or h <= 1:
-                continue
+            if w <= 1 or h <= 1: continue
             cleaned.append((tb, x, y, w, h))
         if cleaned:
             cleaned.sort(key=lambda t: t[0])
             tmap[tid] = cleaned
 
-    def last_box_before(tid: int, t: float):
-        arr = tmap.get(tid) or []
-        last = None
-        for (tb, x, y, w, h) in arr:
-            if tb <= t:
-                last = (x, y, w, h)
-            else:
-                break
-        return last
-
-    def track_support_count(tid: int) -> int:
-        return len(tmap.get(tid) or [])
-
-    # If fused is empty, synthesize a single interval from tracks' time span
-    fused_intervals: List[Tuple[float, float, int]] = []
+    # Validate fused segments
+    fused_intervals: List[Tuple[float, float, Optional[int]]] = []
     if fused:
-        # Validate fused and keep only sane segments
         for seg in fused:
-            if seg is None or len(seg) != 3:
-                continue
+            if seg is None or len(seg) != 3: continue
             s_raw, e_raw, tid_raw = seg
             try:
-                s = _as_float(s_raw, "fused.start")
-                e = _as_float(e_raw, "fused.end")
-                tid = int(tid_raw)
+                s, e = _as_float(s_raw, "f.s"), _as_float(e_raw, "f.e")
+                tid: Optional[int] = int(tid_raw) if tid_raw is not None else None
             except Exception:
                 continue
-            if e <= s:
-                continue
+            if e <= s: continue
             fused_intervals.append((s, e, tid))
-    else:
-        # Derive a reasonable default interval and speaker id from tracks
-        all_times: List[float] = []
-        for arr in tmap.values():
-            all_times.extend([tb for (tb, *_rest) in arr])
-        if all_times:
-            s_def = min(all_times)
-            e_def = max(all_times)
-            # choose the most supported track
-            cand = sorted((tid for tid in tmap.keys()), key=lambda t: track_support_count(t), reverse=True)
-            if cand:
-                fused_intervals = [(s_def, e_def, cand[0])]
 
-    schedule: List[Tuple[float, float, float, float, float, float]] = []
+    # Helper to find active speaker at a specific time
+    def get_tid_at(t: float) -> Optional[int]:
+        for (s, e, tid) in fused_intervals:
+            if s <= t < e:
+                return tid
+        # Check the last segment's end time explicitly
+        if fused_intervals:
+             last_s, last_e, last_tid = fused_intervals[-1]
+             if t == last_e:
+                 return last_tid
+        return None # No active speaker (silence)
+
+    # Helper to find the nearest face box (cx) for a track at a specific time
+    def get_nearest_cx(tid: int, t: float) -> Optional[float]:
+        arr = tmap.get(tid) or []
+        if not arr:
+            return None
+        # Find box with minimum time difference
+        best_box = min(arr, key=lambda box: abs(box[0] - t))
+        return best_box[1] + best_box[3] / 2.0 # cx = x + w/2
+
+    # Find the "most visible" track as a fallback
+    most_supported_tid: Optional[int] = None
+    if tmap:
+        most_supported_tid = max(tmap.keys(), key=lambda tid: len(tmap[tid]))
+
+    # --- Fallback ---
     if not fused_intervals:
-        # If still nothing, return a single center-crop over the entire visible time window (or time 0..0.001)
-        # This keeps active-crop alive but clearly indicates upstream detectors were too sparse.
-        # We avoid raising to keep your run flowing for batches; you can detect this case by seeing a single interval.
-        s_fallback = 0.0
-        e_fallback = 0.001
-        cx = W / 2.0
-        x = max(0.0, min(cx - crop_w / 2.0, W - crop_w))
-        schedule.append((s_fallback, e_fallback, float(x), 0.0, float(crop_w), float(crop_h)))
-        return schedule
+        x = max(0.0, min(default_cx - crop_w / 2.0, W - crop_w))
+        return [(0.0, 0.001, float(x), 0.0, float(crop_w), float(crop_h))]
 
-    for (s, e, tid) in fused_intervals:
-        # Pick the last box before 's' for that track; if none, try the earliest box for that track
-        box = last_box_before(tid, s)
-        if box is None:
-            arr = tmap.get(tid) or []
-            if arr:
-                _tb, x0, y0, w0, h0 = arr[0]
-                box = (x0, y0, w0, h0)
+    # --- Build Throttled Timeline ---
+    all_times = set()
+    fused_min_t = min(s for s,e,_ in fused_intervals)
+    fused_max_t = max(e for s,e,_ in fused_intervals)
 
-        # If still None (no boxes for this tid), try the most supported track overall
-        if box is None:
-            cand = sorted((tid2 for tid2 in tmap.keys()), key=lambda t: track_support_count(t), reverse=True)
-            if cand:
-                arr = tmap.get(cand[0]) or []
-                if arr:
-                    _tb, x0, y0, w0, h0 = arr[0]
-                    box = (x0, y0, w0, h0)
+    # Add segment boundaries
+    for (s, e, _) in fused_intervals:
+        all_times.add(s)
+        all_times.add(e)
 
-        # If we genuinely have no boxes at all, center in the frame to keep schedule valid
-        if box is None:
-            cx = W / 2.0
+    # --- START: [WinError 206] FIX ---
+    # Add throttled time points (e.g., every 100ms) ONLY during speech
+    MIN_STEP_MS = 100.0 / 1000.0 # 100ms
+    
+    for (s_seg, e_seg, tid) in fused_intervals:
+        if tid is not None: # Only add steps during active speech
+            t = s_seg
+            while t < e_seg:
+                all_times.add(t)
+                t += MIN_STEP_MS
+    # --- END: [WinError 206] FIX ---
+            
+    sorted_times = sorted(list(all_times))
+    
+    # --- Build Stair-Step Schedule ---
+    schedule = []
+    last_cx = default_cx # Start centered
+
+    for i in range(len(sorted_times)):
+        s = sorted_times[i]
+        if i + 1 < len(sorted_times):
+            e = sorted_times[i+1]
         else:
-            x0, y0, w0, h0 = box
-            cx = x0 + w0 / 2.0
+            e = max(s + 0.04, fused_max_t) # Hold last frame
+            
+        if e - s < 0.001: continue # Skip empty segments
+        if s > fused_max_t or e < fused_min_t: continue # Skip segments outside range
 
-        x = max(0.0, min(cx - crop_w / 2.0, W - crop_w))
+        t_mid = (s + e) / 2.0
+        tid = get_tid_at(t_mid)
+
+        target_cx: Optional[float] = None
+        if tid is not None:
+            target_cx = get_nearest_cx(tid, t_mid)
+        
+        # If active speaker has no box, use fallback track
+        if target_cx is None and most_supported_tid is not None:
+            target_cx = get_nearest_cx(most_supported_tid, t_mid)
+            
+        # If no faces at all, use default center
+        if target_cx is None:
+            target_cx = default_cx
+
+        # Apply EMA smoothing
+        smoothed_cx = alpha * last_cx + (1.0 - alpha) * target_cx
+        last_cx = smoothed_cx # Update for next iteration
+
+        # Calculate final x, clamped to boundaries
+        x = max(0.0, min(smoothed_cx - crop_w / 2.0, W - crop_w))
+        
         schedule.append((float(s), float(e), float(x), 0.0, float(crop_w), float(crop_h)))
+    
+    # --- Merge consecutive segments with the same crop ---
+    if not schedule:
+         x = max(0.0, min(default_cx - crop_w / 2.0, W - crop_w))
+         return [(fused_min_t, fused_max_t, float(x), 0.0, float(crop_w), float(crop_h))]
 
-    return schedule
+    merged_schedule = []
+    s_start, e_end, x_last, y, w, h = schedule[0]
+    
+    for i in range(1, len(schedule)):
+        s_next, e_next, x_next, y_next, w_next, h_next = schedule[i]
+        
+        # Check if crop x is very close and segments are contiguous
+        if abs(x_next - x_last) < 1.0 and abs(s_next - e_end) < 0.01:
+            # Merge: extend the end time
+            e_end = e_next
+        else:
+            # Different crop or gap in time: save previous segment and start new one
+            if e_end > s_start:
+                merged_schedule.append((s_start, e_end, x_last, y, w, h))
+            s_start, e_end, x_last = s_next, e_next, x_next
+            
+    # Add the last segment
+    if e_end > s_start:
+        merged_schedule.append((s_start, e_end, x_last, y, w, h))
+
+    return merged_schedule

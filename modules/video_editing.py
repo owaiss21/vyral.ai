@@ -61,7 +61,7 @@ def safe_stem(s: str) -> str:
 def _ffmpeg_sub_path_arg(sub_path: Path) -> str:
     # Convert Windows "C:/..." to "C\:/..." for FFmpeg
     p = sub_path.resolve().as_posix()
-    p = _DRIVE_COLON.sub(r"\1\:/", p)  # <-- FIX: single backslash, expands \1 to drive letter
+    p = _DRIVE_COLON.sub(r"\1\:/", p)
     return f"subtitles=filename='{p}'"
 
 # --------------------------- ASS subtitles ---------------------------
@@ -193,7 +193,11 @@ def cut_portrait_with_subs(
     title = (clip.get("title") or "").strip()
     caption = (clip.get("caption") or "").strip()
 
-    tmp_dir = Path(tempfile.mkdtemp(prefix="shorts_"))
+    # Create a local temp dir to avoid cross-drive issues
+    local_temp_base = Path.cwd() / ".temp_ffmpeg"
+    local_temp_base.mkdir(exist_ok=True)
+    tmp_dir = Path(tempfile.mkdtemp(prefix="shorts_", dir=str(local_temp_base)))
+    
     try:
         # 1) ASS for this clip window (built from transcript JSON)
         ass_path = tmp_dir / f"{safe_stem(inp.stem)}_{int(round(start))}_{int(round(end))}.ass"
@@ -203,7 +207,9 @@ def cut_portrait_with_subs(
         use_active = bool(getattr(CFG, "enable_active_crop", True))
         if use_active:
             try:
-                from modules.active_crop import faces as ac_faces, asd as ac_asd, diar as ac_diar, fuser as ac_fuser, path as ac_path, render as ac_render
+                from active_crop import faces as ac_faces, asd as ac_asd, diar as ac_diar, fuser as ac_fuser, path as ac_path, render as ac_render
+            except ImportError:
+                from .active_crop import faces as ac_faces, asd as ac_asd, diar as ac_diar, fuser as ac_fuser, path as ac_path, render as ac_render
             except Exception as e:
                 raise RuntimeError(f"[active-crop:init] import failed: {e}") from e
 
@@ -263,7 +269,22 @@ def cut_portrait_with_subs(
         vf_sub = f"{core_vf},{_ffmpeg_sub_path_arg(ass_path)}"
 
         # 4) Output/encode
-        base_name = f"{safe_stem(title or inp.stem)}-{safe_stem(caption) if caption else f'{int(start)}_{int(end)}'}"
+        
+        # --- START: [WinError 206] FILENAME FIX ---
+        # Aggressively truncate title and caption to prevent overly long filenames
+        MAX_TITLE_LEN = 60
+        MAX_CAPTION_LEN = 60
+        
+        safe_title = safe_stem((title or inp.stem))
+        safe_title_part = safe_title[:MAX_TITLE_LEN]
+        
+        if caption:
+            safe_caption_part = safe_stem(caption)[:MAX_CAPTION_LEN]
+            base_name = f"{safe_title_part}-{safe_caption_part}"
+        else:
+            base_name = f"{safe_title_part}-{int(start)}_{int(end)}"
+        # --- END: [WinError 206] FILENAME FIX ---
+
         out_path = out_dir_p / f"{base_name}.mp4"
         out_path_sub = out_dir_p / f"{base_name}_sub.mp4"
 

@@ -1,23 +1,34 @@
 from __future__ import annotations
 from typing import List, Tuple
 import subprocess, tempfile, os
+from pathlib import Path  # <-- IMPORT PATHLIB
 import numpy as np
 import torch
 from scipy.io import wavfile
 
 def _ffmpeg_extract_wav_16k_mono(video_path: str, t0: float, t1: float) -> str:
     dur = max(0.01, float(t1) - float(t0))
-    tmp_wav = tempfile.NamedTemporaryFile(prefix="vad_", suffix=".wav", delete=False)
+    
+    # --- START: [ValueError] FIX ---
+    # Create a local temp dir to avoid cross-drive issues with Streamlit
+    # This forces the temp file to be on the same drive as the script.
+    local_temp_dir = Path.cwd() / ".temp_vad_audio"
+    local_temp_dir.mkdir(exist_ok=True)
+    tmp_wav = tempfile.NamedTemporaryFile(prefix="vad_", suffix=".wav", delete=False, dir=str(local_temp_dir))
+    # --- END: [ValueError] FIX ---
+    
     tmp_wav.close()
+    wav_path = tmp_wav.name
+    
     cmd = [
         "ffmpeg", "-y",
         "-ss", f"{t0:.3f}", "-t", f"{dur:.3f}",
         "-i", video_path,
         "-ac", "1", "-ar", "16000", "-vn",
-        tmp_wav.name,
+        wav_path, # Use the path
     ]
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return tmp_wav.name
+    return wav_path
 
 def speech_regions(video_path: str, t0: float, t1: float) -> List[Tuple[float, float]]:
     """

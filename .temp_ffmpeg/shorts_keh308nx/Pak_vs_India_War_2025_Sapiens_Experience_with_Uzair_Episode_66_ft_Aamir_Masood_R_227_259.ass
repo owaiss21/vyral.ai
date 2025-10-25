@@ -1,0 +1,41 @@
+[Script Info]
+ScriptType: v4.00+
+PlayResX: 1080
+PlayResY: 1920
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Caption,Arial,92,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,0,0,0,0,100,100,0,0,1,4,0,2,80,80,180,0
+Style: Emph,Arial Black,112,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,1,0,0,0,100,100,0,0,1,4,0,2,80,80,180,0
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:03:47.40,0:03:48.65,Caption,,0000,0000,0000,,{\b1}AJZA{\b0} SAR AAP KO
+Dialogue: 0,0:03:48.65,0:03:49.89,Caption,,0000,0000,0000,,AAP KE JO {\b1}CADET{\b0}
+Dialogue: 0,0:03:49.89,0:03:51.45,Caption,,0000,0000,0000,,DEZ {\b1}HAIN{\b0} UN KI RAH
+Dialogue: 0,0:03:51.45,0:03:52.69,Caption,,0000,0000,0000,,{\b1}FUROOS{\b0} SE LE KE
+Dialogue: 0,0:03:52.69,0:03:53.94,Caption,,0000,0000,0000,,{\b1}JAATE{\b0} HAIN AUR JAB
+Dialogue: 0,0:03:53.94,0:03:54.87,Caption,,0000,0000,0000,,{\b1}PAKISTAN{\b0} KI JO
+Dialogue: 0,0:03:54.87,0:03:55.80,Caption,,0000,0000,0000,,{\b1}UOMI{\b0} HAI YA
+Dialogue: 0,0:03:55.80,0:03:57.05,Caption,,0000,0000,0000,,{\b1}PAKISTAN{\b0} KE JO AIR
+Dialogue: 0,0:03:57.05,0:03:58.30,Caption,,0000,0000,0000,,{\b1}FORCE{\b0} YA JIS TANI
+Dialogue: 0,0:03:58.30,0:03:59.54,Caption,,0000,0000,0000,,BHI {\b1}AWARI{\b0} FORCE KE
+Dialogue: 0,0:03:59.54,0:04:00.47,Caption,,0000,0000,0000,,{\b1}NUMBER{\b0} HAIN WOH
+Dialogue: 0,0:04:00.47,0:04:01.10,Caption,,0000,0000,0000,,{\b1}COMPLETELY{\b0} KAAM
+Dialogue: 0,0:04:01.10,0:04:02.03,Caption,,0000,0000,0000,,HAI {\b1}KAAM{\b0} HAI
+Dialogue: 0,0:04:02.03,0:04:02.96,Caption,,0000,0000,0000,,{\b1}COMPARED{\b0} TO INDIA
+Dialogue: 0,0:04:02.96,0:04:04.21,Caption,,0000,0000,0000,,JAB AAP KE {\b1}CADET{\b0}
+Dialogue: 0,0:04:04.21,0:04:05.14,Caption,,0000,0000,0000,,KI {\b1}TRAINING{\b0} CHAL
+Dialogue: 0,0:04:05.14,0:04:06.39,Caption,,0000,0000,0000,,{\b1}RAHI{\b0} HOTI HAI AISI
+Dialogue: 0,0:04:06.39,0:04:07.32,Caption,,0000,0000,0000,,KON SI {\b1}CHEEZEIN{\b0}
+Dialogue: 0,0:04:07.32,0:04:08.26,Caption,,0000,0000,0000,,HAIN JO {\b1}INITIALLY{\b0}
+Dialogue: 0,0:04:08.26,0:04:09.19,Caption,,0000,0000,0000,,{\b1}BATAI{\b0} JAATI HAIN
+Dialogue: 0,0:04:09.19,0:04:10.44,Caption,,0000,0000,0000,,KISI BHI {\b1}CADET{\b0} KO
+Dialogue: 0,0:04:10.44,0:04:11.37,Caption,,0000,0000,0000,,{\b1}KYUNKE{\b0} EK NUMBER
+Dialogue: 0,0:04:11.37,0:04:12.93,Caption,,0000,0000,0000,,{\b1}MEIN{\b0} TO HUM SE WOH
+Dialogue: 0,0:04:12.93,0:04:13.86,Caption,,0000,0000,0000,,{\b1}BOHAT{\b0} ZYADA BADE
+Dialogue: 0,0:04:13.86,0:04:15.42,Caption,,0000,0000,0000,,{\b1}HAIN{\b0} AUR WOH UN KE
+Dialogue: 0,0:04:15.42,0:04:16.35,Caption,,0000,0000,0000,,PAAS {\b1}EQUIPMENT{\b0} BHI
+Dialogue: 0,0:04:16.35,0:04:17.28,Caption,,0000,0000,0000,,AUR {\b1}WARFARE{\b0} KA
+Dialogue: 0,0:04:17.28,0:04:18.22,Caption,,0000,0000,0000,,{\b1}SAMAAN{\b0} BHI KAAFI
+Dialogue: 0,0:04:18.22,0:04:18.84,Caption,,0000,0000,0000,,{\b1}ZYADA{\b0} HAI

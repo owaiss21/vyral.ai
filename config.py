@@ -7,7 +7,7 @@ class Config:
     # Transcription / ASR
     # ────────────────────────────────────────────────────────────────
     whisper_model: str = "medium"              # faster-whisper model size
-    device: str = "auto"                       # "cuda" | "cpu" | "auto"
+    device: str = "cpu"                       # "cuda" | "cpu" | "auto"
     word_timestamps: bool = True
     force_language: Optional[str] = None       # e.g. "ur", "hi", "en"
 

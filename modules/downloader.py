@@ -2,10 +2,11 @@ import os
 import subprocess
 import yt_dlp
 
+
 def download_youtube_video(
     youtube_url: str,
     raw_video_output_dir: str = "raw_videos",
-    quality: int = 720,
+    quality: int = 1080,
 ) -> str:
 
     os.makedirs(raw_video_output_dir, exist_ok=True)
@@ -29,7 +30,7 @@ def download_youtube_video(
         print(f"Error fetching video title: {e}")
         # Fallback to a generic name if title fetch fails
         output_filename = "downloaded_video.mp4"
-        
+
     output_path = os.path.join(raw_video_output_dir, output_filename)
 
     ydl_opts = {
@@ -45,7 +46,6 @@ def download_youtube_video(
         }],
     }
 
-
     print(f"Starting download for: {youtube_url}")
     print(f"Requested quality: {quality}p")
     print(f"Saving to: {output_path}")
@@ -53,7 +53,7 @@ def download_youtube_video(
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([youtube_url])
-        
+
         if os.path.exists(output_path):
             print("\nDownload and processing complete.")
             print(f"Video saved successfully at: {output_path}")
@@ -61,14 +61,13 @@ def download_youtube_video(
         else:
             print("\nDownload failed. The output file was not created.")
             return ""
-            
+
     except Exception as e:
         print(f"\nAn error occurred during the download process: {e}")
         return ""
 
 
 if __name__ == '__main__':
-
     import argparse
     ap = argparse.ArgumentParser(description="Download a YouTube video to MP4")
     ap.add_argument("--url", required=True, help="YouTube URL")

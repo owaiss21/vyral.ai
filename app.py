@@ -1,5 +1,8 @@
 from __future__ import annotations
-
+import os
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")  # allow single-process coexistence
+os.environ.setdefault("OMP_NUM_THREADS", "1")          # reduce thread contention
+os.environ.setdefault("MKL_SERVICE_FORCE_INTEL", "1")  
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 import time
